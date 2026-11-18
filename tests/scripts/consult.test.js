@@ -75,7 +75,7 @@ function runTests() {
     assert.ok(payload.matches[0].reasons.some(reason => reason.includes('security')));
     assert.strictEqual(
       payload.matches[0].installCommand,
-      'npx ecc install --profile minimal --target claude --with capability:security'
+      'npx ecc-universal install --profile minimal --target claude --with capability:security'
     );
     assert.ok(payload.profiles.some(profile => profile.id === 'security'));
     assert.ok(payload.profiles.find(profile => profile.id === 'security').installCommand.includes('--profile security'));
@@ -87,8 +87,8 @@ function runTests() {
     assert.strictEqual(result.status, 0, result.stderr);
     assert.match(result.stdout, /ECC consult/);
     assert.match(result.stdout, /capability:security/);
-    assert.match(result.stdout, /npx ecc install --profile minimal --target claude --with capability:security/);
-    assert.match(result.stdout, /npx ecc plan --profile minimal --target claude --with capability:security/);
+    assert.match(result.stdout, /npx ecc-universal install --profile minimal --target claude --with capability:security/);
+    assert.match(result.stdout, /npx ecc-universal plan --profile minimal --target claude --with capability:security/);
   })) passed++; else failed++;
 
   if (test('recommends machine-learning component and reviewer agent', () => {
@@ -171,6 +171,23 @@ function runTests() {
     assert.strictEqual(payload.matches.length, 1);
     assert.ok(payload.matches[0].targets.includes('codex'));
     assert.ok(payload.matches[0].installCommand.includes('--target codex'));
+  })) passed++; else failed++;
+
+  if (test('recommends only exact skill installs for Mistral Vibe', () => {
+    const result = run(['test-driven', 'development', '--target', 'mistral-vibe', '--json']);
+
+    assert.strictEqual(result.status, 0, result.stderr);
+    const payload = parseJson(result.stdout);
+    assert.strictEqual(payload.target, 'mistral-vibe');
+    assert.deepStrictEqual(payload.profiles, []);
+    assert.ok(payload.matches.length > 0);
+    assert.ok(payload.matches.every(match => match.family === 'skill'));
+    assert.ok(payload.matches.every(match => match.installCommand.startsWith(
+      'npx ecc-universal install --target mistral-vibe --skills '
+    )));
+    assert.ok(payload.matches.every(match => match.planCommand.startsWith(
+      'npx ecc-universal plan --target mistral-vibe --skills '
+    )));
   })) passed++; else failed++;
 
   if (test('rejects unknown targets', () => {

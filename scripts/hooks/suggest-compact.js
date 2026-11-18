@@ -34,12 +34,13 @@ const {
 } = require('../lib/utils');
 const {
   readLatestContextTokens,
-  resolveContextWindowTokens,
+  resolveContextWindow,
   resolveContextThreshold,
   resolveContextInterval,
   computeContextBucket,
   formatWindowLabel
 } = require('../lib/transcript-context');
+const { isGateActive, gateOwnsTranscript } = require('../lib/context-gate-state');
 
 const COUNTER_FILE_PREFIX = 'claude-tool-count-';
 const CONTEXT_BUCKET_FILE_PREFIX = 'claude-context-bucket-';
@@ -161,7 +162,8 @@ function readLastContextBucket(bucketFile) {
 /**
  * Build the context-size suggestion when the transcript shows the session has
  * crossed into a new context bucket. Returns null when the signal is silent
- * (no transcript, below threshold, disabled, or already fired for the bucket).
+ * (no transcript, below threshold, disabled, gate active, or already fired
+ * for the bucket).
  *
  * Never throws — any transcript or state-file failure silently disables the
  * signal so the hook keeps its always-exit-0 contract.
@@ -171,7 +173,14 @@ function buildContextSuggestion(transcriptPath, bucketFile, env) {
     const usage = readLatestContextTokens(transcriptPath);
     if (!usage) return null;
 
-    const windowTokens = resolveContextWindowTokens(usage.tokens, usage.model);
+    const { windowTokens, inferred } = resolveContextWindow(usage.tokens, usage.model, env);
+
+    // Defer to the context-gate at/above its threshold: the gate is ordering a
+    // checkpoint-and-restart there, and a /compact suggestion in the same
+    // band is a contradictory instruction (compaction is the lossy path the
+    // gate exists to preempt).
+    if (isGateActive({ tokens: usage.tokens, windowTokens, env })) return null;
+
     const threshold = resolveContextThreshold(env, windowTokens);
     if (threshold <= 0) return null; // COMPACT_CONTEXT_THRESHOLD=0 disables
 
@@ -185,8 +194,13 @@ function buildContextSuggestion(transcriptPath, bucketFile, env) {
     writeFile(bucketFile, String(bucket));
 
     const approxTokens = `${Math.round(usage.tokens / 1000)}k`;
-    const percent = Math.round((usage.tokens / windowTokens) * 100);
-    return `[StrategicCompact] Context ~${approxTokens} tokens (${percent}% of ${formatWindowLabel(windowTokens)} window) - consider /compact at the next logical boundary`;
+    // Only quote a percentage when the window size was actually detected.
+    // Against an assumed 200k default the denominator is a guess, and a
+    // "97% of 200k window" line on a 1M session triggers needless compaction.
+    const scale = inferred
+      ? ''
+      : ` (${Math.round((usage.tokens / windowTokens) * 100)}% of ${formatWindowLabel(windowTokens)} window)`;
+    return `[StrategicCompact] Context ~${approxTokens} tokens${scale} - consider /compact at the next logical boundary`;
   } catch (err) {
     log(`[StrategicCompact] Context signal skipped: ${err.message}`);
     return null;
@@ -237,10 +251,15 @@ async function main() {
   }
 
   // Secondary signal: tool-call count at threshold, then every 25 calls.
-  if (count === threshold) {
-    messages.push(`[StrategicCompact] ${threshold} tool calls reached - consider /compact if transitioning phases`);
-  } else if (count > threshold && (count - threshold) % 25 === 0) {
-    messages.push(`[StrategicCompact] ${count} tool calls - good checkpoint for /compact if context is stale`);
+  // Also silenced while the context-gate is active — the gate check reads
+  // the transcript, so it only runs when a count message would fire.
+  const countWouldFire = count === threshold || (count > threshold && (count - threshold) % 25 === 0);
+  if (countWouldFire && !gateOwnsTranscript(transcriptPath, process.env)) {
+    if (count === threshold) {
+      messages.push(`[StrategicCompact] ${threshold} tool calls reached - consider /compact if transitioning phases`);
+    } else {
+      messages.push(`[StrategicCompact] ${count} tool calls - good checkpoint for /compact if context is stale`);
+    }
   }
 
   // log() writes to stderr (debug log). Per the Claude Code hooks guide,

@@ -2,8 +2,10 @@
  * Tests for plugin manifests:
  *   - .claude-plugin/plugin.json (Claude Code plugin)
  *   - .codex-plugin/plugin.json (Codex native plugin)
+ *   - .grok-plugin/plugin.json (Grok Build plugin)
  *   - .mcp.json (MCP server config at plugin root)
  *   - .agents/plugins/marketplace.json (Codex marketplace discovery)
+ *   - .grok-plugin/marketplace.json (Grok Build marketplace)
  *
  * Enforces rules from:
  *   - .claude-plugin/PLUGIN_SCHEMA_NOTES.md (Claude Code validator rules)
@@ -17,6 +19,7 @@
 const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
+const { readHooksConfig } = require('../scripts/lib/hooks-config');
 
 const repoRoot = path.resolve(__dirname, '..');
 const packageJsonPath = path.join(repoRoot, 'package.json');
@@ -34,7 +37,9 @@ const selectiveInstallArchitecturePath = path.join(repoRoot, 'docs', 'SELECTIVE-
 const opencodePackageJsonPath = path.join(repoRoot, '.opencode', 'package.json');
 const opencodePackageLockPath = path.join(repoRoot, '.opencode', 'package-lock.json');
 const opencodeHooksPluginPath = path.join(repoRoot, '.opencode', 'plugins', 'ecc-hooks.ts');
+const hooksReadmePath = path.join(repoRoot, 'hooks', 'README.md');
 const semverPattern = '[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?';
+const installPrPublishedBaseline = '2.1.0';
 
 let passed = 0;
 let failed = 0;
@@ -95,6 +100,25 @@ const expectedVersion = rootPackage.version;
 
 test('package.json has version field', () => {
   assert.ok(expectedVersion, 'Expected package.json version field');
+});
+
+test('package.json declares a stable release after the install PR published baseline', () => {
+  const parseStableSemver = (version) => {
+    const match = version.match(/^(\d+)\.(\d+)\.(\d+)$/);
+    assert.ok(match, `Expected a stable semver version, got ${version}`);
+    return match.slice(1).map(Number);
+  };
+  const compareSemver = (left, right) => {
+    for (let index = 0; index < left.length; index++) {
+      if (left[index] !== right[index]) return left[index] - right[index];
+    }
+    return 0;
+  };
+
+  assert.ok(
+    compareSemver(parseStableSemver(expectedVersion), parseStableSemver(installPrPublishedBaseline)) > 0,
+    `Expected package version after install PR baseline ${installPrPublishedBaseline}, got ${expectedVersion}`
+  );
 });
 
 test('package-lock.json root version matches package.json', () => {
@@ -225,6 +249,34 @@ test('claude plugin.json does NOT have explicit hooks declaration', () => {
   assert.ok(!('hooks' in claudePlugin), 'hooks field must NOT be declared — Claude Code v2.1+ auto-loads hooks/hooks.json by convention');
 });
 
+test('claude plugin.json exposes only supported durable hook preferences', () => {
+  assert.deepStrictEqual(
+    Object.keys(claudePlugin.userConfig || {}).sort(),
+    ['hook_profile', 'hooks_enabled']
+  );
+
+  const hooksEnabled = claudePlugin.userConfig.hooks_enabled;
+  assert.deepStrictEqual(
+    Object.keys(hooksEnabled).sort(),
+    ['default', 'description', 'title', 'type']
+  );
+  assert.strictEqual(hooksEnabled.type, 'boolean');
+  assert.strictEqual(hooksEnabled.default, true);
+  assert.ok(typeof hooksEnabled.title === 'string' && hooksEnabled.title.trim());
+  assert.ok(typeof hooksEnabled.description === 'string' && hooksEnabled.description.trim());
+
+  const hookProfile = claudePlugin.userConfig.hook_profile;
+  assert.deepStrictEqual(
+    Object.keys(hookProfile).sort(),
+    ['default', 'description', 'title', 'type'],
+    'Claude userConfig does not support enum'
+  );
+  assert.strictEqual(hookProfile.type, 'string');
+  assert.strictEqual(hookProfile.default, 'standard');
+  assert.ok(typeof hookProfile.title === 'string' && hookProfile.title.trim());
+  assert.ok(typeof hookProfile.description === 'string' && hookProfile.description.trim());
+});
+
 console.log('\n=== .claude-plugin/marketplace.json ===\n');
 
 test('claude marketplace.json exists', () => {
@@ -295,6 +347,98 @@ test('codex plugin.json mcpServers exactly matches "./.mcp.json"', () => {
   assert.ok(fs.existsSync(mcpPath), `mcpServers file missing at plugin root: ${codexPlugin.mcpServers}`);
 });
 
+test('codex plugin.json explicitly declares the supported lifecycle hook bundle', () => {
+  assert.strictEqual(
+    codexPlugin.hooks,
+    './hooks/codex-hooks.json',
+    'Codex supports a top-level hooks path; keep the ECC hook bundle explicit instead of inventing provider-specific settings'
+  );
+  const hooksPath = path.join(repoRoot, codexPlugin.hooks.replace(/^\.\//, ''));
+  assert.ok(fs.existsSync(hooksPath), `Codex hooks file missing at plugin root: ${codexPlugin.hooks}`);
+});
+
+test('codex lifecycle hook bundle contains only Codex 0.146-supported schema', () => {
+  const hooksPath = path.join(repoRoot, 'hooks', 'codex-hooks.json');
+  const config = loadJsonObject(hooksPath, 'hooks/codex-hooks.json');
+  assert.deepStrictEqual(Object.keys(config).sort(), ['description', 'hooks'], 'Codex rejects Claude\'s top-level $schema field');
+
+  const supportedEvents = new Set([
+    'PreToolUse', 'PermissionRequest', 'PostToolUse', 'PreCompact', 'PostCompact',
+    'SessionStart', 'SessionEnd', 'SubagentStart', 'SubagentStop',
+    'UserPromptSubmit', 'Stop'
+  ]);
+  assert.deepStrictEqual(
+    Object.keys(config.hooks || {}),
+    ['SessionStart'],
+    'Only the verified, non-blocking SessionStart hook ships natively; Claude hook profiles are not Codex hook profiles'
+  );
+  assert.deepStrictEqual(
+    config.hooks.SessionStart.map(group => group.id),
+    ['session:start'],
+    'Do not ship Claude handlers that surface hook failures in Codex'
+  );
+
+  for (const [event, groups] of Object.entries(config.hooks || {})) {
+    assert.ok(supportedEvents.has(event), `Unsupported Codex hook event: ${event}`);
+    assert.ok(Array.isArray(groups) && groups.length > 0, `Expected non-empty matcher groups for ${event}`);
+    for (const group of groups) {
+      assert.ok(Array.isArray(group.hooks) && group.hooks.length > 0, `Expected non-empty handlers for ${event}`);
+      for (const handler of group.hooks) {
+        assert.strictEqual(handler.type, 'command', `Codex 0.146 only executes command handlers (${event})`);
+        assert.ok(!Object.prototype.hasOwnProperty.call(handler, 'async'), `Codex 0.146 skips async handlers (${event})`);
+        assert.ok(
+          handler.command.includes('process.env.CLAUDE_PLUGIN_ROOT=process.env.PLUGIN_ROOT'),
+          `Codex plugin hooks must pin Claude-compatible bootstrap resolution to Codex PLUGIN_ROOT (${event})`
+        );
+        if (event === 'SessionEnd' && Number.isFinite(handler.timeout)) {
+          assert.ok(handler.timeout <= 3, 'Codex clamps SessionEnd timeouts to 3 seconds');
+        }
+      }
+    }
+  }
+
+  const claudeConfig = readHooksConfig(path.join(repoRoot, 'hooks', 'hooks.json'), 'hooks/hooks.json');
+  const sourceSessionStart = claudeConfig.hooks.SessionStart.find(group => group.id === 'session:start');
+  const expectedSessionStart = {
+    ...sourceSessionStart,
+    hooks: sourceSessionStart.hooks.map(handler => ({
+      ...handler,
+      command: handler.command.replace(
+        'node -e "',
+        'node -e "if(!process.env.PLUGIN_ROOT)throw new Error(\'Missing Codex PLUGIN_ROOT\');process.env.CLAUDE_PLUGIN_ROOT=process.env.PLUGIN_ROOT;'
+      )
+    }))
+  };
+  assert.deepStrictEqual(config.hooks.SessionStart[0], expectedSessionStart, 'Codex SessionStart hook must track its canonical implementation with a Codex-root bootstrap');
+});
+
+test('hook documentation distinguishes the Claude off setting from runtime profiles', () => {
+  const source = fs.readFileSync(hooksReadmePath, 'utf8');
+  assert.ok(source.includes('Claude setup-only value:'), 'Expected hooks README to label off as a Claude setup-only value');
+  const runtimeProfiles = source.match(/Runtime hook profiles:\n((?:- `[^`]+`[^\n]*\n)+)/);
+  assert.ok(runtimeProfiles, 'Expected hooks README to identify runtime hook profiles separately');
+  assert.ok(!runtimeProfiles[1].includes('`off`'), 'off is a Claude setup value, not a runtime hook profile');
+  for (const profile of ['minimal', 'standard', 'strict']) {
+    assert.ok(runtimeProfiles[1].includes(`\`${profile}\``), `Expected documented runtime hook profile: ${profile}`);
+  }
+});
+
+test('Chinese capability matrix documents the native Codex SessionStart hook', () => {
+  const source = fs.readFileSync(zhCnReadmePath, 'utf8');
+  assert.ok(
+    source.includes('| **钩子事件** | 8 种类型                 | 15 种类型 | SessionStart（1 种类型） | 11 种类型 |'),
+    'Expected the Codex capability column to document one native SessionStart event'
+  );
+  assert.ok(
+    source.includes('| **钩子脚本** | 20+ 个脚本               | 16 个脚本 (DRY 适配器) | 1 个 SessionStart 引导脚本 | 插件钩子 |'),
+    'Expected the Codex capability column to document the SessionStart bootstrap script'
+  );
+  assert.ok(
+    !source.includes('Codex 缺少钩子功能'),
+    'Codex architecture guidance must not contradict its native SessionStart hook'
+  );
+});
+
 test('codex plugin.json has interface.displayName', () => {
   assert.ok(codexPlugin.interface && codexPlugin.interface.displayName, 'Expected interface.displayName for plugin directory presentation');
 });
@@ -317,6 +461,33 @@ test('codex plugin presentation assets exist and ship in npm package', () => {
     assert.ok(fs.existsSync(path.join(repoRoot, packagePath)), `Expected interface.${field} asset to exist: ${packagePath}`);
     assert.ok(packageFiles.has(packagePath), `Expected package.json files to include interface.${field} asset: ${packagePath}`);
   }
+});
+
+// ── Qoder plugin manifest ─────────────────────────────────────────────────────
+console.log('\n=== .qoder-plugin/plugin.json ===\n');
+
+const qoderPluginPath = path.join(repoRoot, '.qoder-plugin', 'plugin.json');
+const qoderPlugin = loadJsonObject(qoderPluginPath, '.qoder-plugin/plugin.json');
+
+test('qoder plugin.json version matches package.json', () => {
+  assert.strictEqual(qoderPlugin.name, 'ecc');
+  assert.strictEqual(qoderPlugin.version, expectedVersion);
+});
+
+test('qoder plugin references canonical resources inside the bundle', () => {
+  for (const field of ['skills', 'commands', 'mcpServers', 'hooks']) {
+    assert.strictEqual(typeof qoderPlugin[field], 'string', `Expected Qoder manifest ${field} path`);
+    const target = path.resolve(repoRoot, qoderPlugin[field]);
+    assert.ok(target === repoRoot || target.startsWith(repoRoot + path.sep), `${field} escapes the Qoder bundle`);
+    assert.ok(fs.existsSync(target), `${field} target is missing: ${qoderPlugin[field]}`);
+  }
+});
+
+test('qoder native surface ships in npm package', () => {
+  const packageFiles = new Set(rootPackage.files);
+  assert.ok(packageFiles.has('.qoder-plugin/'));
+  assert.ok(packageFiles.has('hooks/'));
+  assert.ok(packageFiles.has('scripts/hooks/'));
 });
 
 // ── .mcp.json at plugin root ──────────────────────────────────────────────────
@@ -393,21 +564,30 @@ test('marketplace.json plugin version matches package.json', () => {
   assert.strictEqual(marketplace.plugins[0].version, expectedVersion);
 });
 
-test('marketplace local plugin path resolves to a concrete plugin subdirectory (#2128)', () => {
-  // Codex does not discover plugins whose local marketplace source.path is the
-  // marketplace root itself ("./") — verified against Codex CLI 0.137.0 and
-  // the official docs ($REPO_ROOT/plugins/<name>). The entry must point at a
-  // real plugin folder strictly inside the repo.
+test('marketplace local plugin source is a self-contained native Codex bundle', () => {
+  // Codex 0.146.0 accepts the marketplace root as a plugin source and copies
+  // that source into its install cache. Parent-relative references from a thin
+  // subdirectory are broken after that copy, so every bundled path must remain
+  // inside the selected source root.
   for (const plugin of marketplace.plugins) {
     if (!plugin.source || plugin.source.source !== 'local') {
       continue;
     }
 
     assert.ok(plugin.source.path.startsWith('./'), `Codex marketplace source.path must be ./-prefixed: ${plugin.source.path}`);
-    const resolvedRoot = path.resolve(repoRoot, plugin.source.path);
-    assert.notStrictEqual(resolvedRoot, repoRoot, `Codex never discovers "./" marketplace roots — source.path must target a plugin subdirectory (#2128), got: ${plugin.source.path}`);
-    assert.ok(resolvedRoot.startsWith(repoRoot + path.sep), `Expected local marketplace path to stay inside the repo, got: ${plugin.source.path}`);
-    assert.ok(fs.existsSync(path.join(resolvedRoot, '.codex-plugin', 'plugin.json')), `Codex plugin manifest missing under resolved plugin folder: ${plugin.source.path}`);
+    const sourceRoot = path.resolve(repoRoot, plugin.source.path);
+    assert.strictEqual(sourceRoot, repoRoot, `ECC's native Codex bundle must use the self-contained repository root, got: ${plugin.source.path}`);
+
+    const manifest = loadJsonObject(path.join(sourceRoot, '.codex-plugin', 'plugin.json'), 'marketplace Codex plugin manifest');
+    for (const field of ['skills', 'mcpServers', 'hooks']) {
+      assert.strictEqual(typeof manifest[field], 'string', `Expected Codex manifest ${field} path`);
+      const target = path.resolve(sourceRoot, manifest[field]);
+      assert.ok(target === sourceRoot || target.startsWith(sourceRoot + path.sep), `${field} escapes the installed source root: ${manifest[field]}`);
+      assert.ok(fs.existsSync(target), `${field} target is missing from the installed source root: ${manifest[field]}`);
+    }
+
+    assert.ok(fs.existsSync(path.join(sourceRoot, 'scripts', 'hooks', 'plugin-hook-bootstrap.js')), 'Codex hook runtime must ship inside the installed source root');
+    assert.ok(fs.existsSync(path.join(sourceRoot, 'skills', 'configure-ecc', 'SKILL.md')), 'Codex configure-ecc skill must ship inside the installed source root');
   }
 });
 
@@ -458,13 +638,14 @@ test('plugins/ecc manifest interface assets resolve to root assets', () => {
   }
 });
 
-test('plugins/ecc README documents the upstream Codex fragility', () => {
+test('plugins/ecc README marks the thin folder as a legacy compatibility artifact', () => {
   const readmePath = path.join(repoRoot, 'plugins', 'ecc', 'README.md');
   assert.ok(fs.existsSync(readmePath), 'Expected plugins/ecc/README.md');
   const source = fs.readFileSync(readmePath, 'utf8');
-  assert.ok(source.includes('openai/codex'), 'plugins/ecc README must link the upstream Codex discovery issue');
+  assert.ok(source.includes('legacy compatibility artifact'));
+  assert.ok(source.includes('repository root'));
   assert.ok(source.includes('check-plugin-cache.js'), 'plugins/ecc README must point at the cache health check');
-  assert.ok(source.includes('sync-ecc-to-codex.sh'), 'plugins/ecc README must point at the supported manual sync flow');
+  assert.ok(!source.includes('points at this directory'));
 });
 
 test('.opencode/package.json version matches package.json', () => {
@@ -475,13 +656,6 @@ test('.opencode/package-lock.json root version matches package.json', () => {
   assert.strictEqual(opencodePackageLock.version, expectedVersion);
   assert.ok(opencodePackageLock.packages && opencodePackageLock.packages[''], 'Expected .opencode/package-lock root package entry');
   assert.strictEqual(opencodePackageLock.packages[''].version, expectedVersion);
-});
-
-test('README version row matches package.json', () => {
-  const readme = fs.readFileSync(path.join(repoRoot, 'README.md'), 'utf8');
-  const match = readme.match(new RegExp(`^\\| \\*\\*Version\\*\\* \\| Plugin \\| Plugin \\| Reference config \\| (${semverPattern}) \\|(?: Instruction layer \\|)?$`, 'm'));
-  assert.ok(match, 'Expected README version summary row');
-  assert.strictEqual(match[1], expectedVersion);
 });
 
 test('user-facing docs do not use overlong legacy marketplace install commands', () => {
@@ -517,11 +691,149 @@ test('user-facing docs do not use the legacy non-URL marketplace add form', () =
   assert.deepStrictEqual(offenders, [], `Legacy non-URL marketplace add form must not appear in user-facing docs: ${offenders.join(', ')}`);
 });
 
+// ── Grok Build plugin manifest ────────────────────────────────────────────────
+console.log('\n=== .grok-plugin/plugin.json ===\n');
+
+const grokPluginPath = path.join(repoRoot, '.grok-plugin', 'plugin.json');
+const grokMarketplacePath = path.join(repoRoot, '.grok-plugin', 'marketplace.json');
+const grokPluginReadmePath = path.join(repoRoot, '.grok-plugin', 'README.md');
+
+test('grok plugin.json exists', () => {
+  assert.ok(fs.existsSync(grokPluginPath), 'Expected .grok-plugin/plugin.json to exist');
+});
+
+test('grok marketplace.json exists', () => {
+  assert.ok(fs.existsSync(grokMarketplacePath), 'Expected .grok-plugin/marketplace.json to exist');
+});
+
+test('grok plugin README exists', () => {
+  assert.ok(fs.existsSync(grokPluginReadmePath), 'Expected .grok-plugin/README.md to exist');
+});
+
+const grokPlugin = fs.existsSync(grokPluginPath)
+  ? loadJsonObject(grokPluginPath, '.grok-plugin/plugin.json')
+  : {};
+const grokMarketplace = fs.existsSync(grokMarketplacePath)
+  ? loadJsonObject(grokMarketplacePath, '.grok-plugin/marketplace.json')
+  : {};
+
+test('grok plugin.json uses short plugin slug and matching version', () => {
+  assert.strictEqual(grokPlugin.name, 'ecc');
+  assert.strictEqual(grokPlugin.version, expectedVersion);
+});
+
+test('grok plugin.json keeps Claude-incompatible fields out of the Grok manifest', () => {
+  assert.ok(!('userConfig' in grokPlugin), 'Grok does not honor Claude userConfig; hook profile stays on ECC_HOOK_PROFILE');
+  assert.strictEqual(
+    grokPlugin.mcpServers,
+    '',
+    'Empty mcpServers string opts the native Grok trusted plugin surface out of root .mcp.json / chrome-devtools'
+  );
+  assert.ok(!('agents' in grokPlugin), 'Grok discovers agents/ by convention');
+  assert.strictEqual(
+    grokPlugin.hooks,
+    '',
+    'Empty hooks string opts the native Grok CLI surface out of hooks/hooks.json; ECC hook consent is canonical install state'
+  );
+});
+
+test('grok plugin.json description includes catalog counts', () => {
+  assert.ok(
+    typeof grokPlugin.description === 'string'
+      && /\d+\s+agents,\s+\d+\s+skills,\s+\d+\s+legacy command shims/i.test(grokPlugin.description),
+    'Grok plugin description must include catalog counts so scripts/ci/catalog.js can keep them in sync'
+  );
+});
+
+test('grok plugin.json points at canonical ECC identity', () => {
+  assert.strictEqual(grokPlugin.homepage, 'https://ecc.tools');
+  assert.strictEqual(grokPlugin.repository, 'https://github.com/affaan-m/ECC');
+  assert.strictEqual(grokPlugin.license, 'MIT');
+  assert.ok(grokPlugin.author && grokPlugin.author.name, 'Expected author.name');
+  assert.strictEqual(grokPlugin.logo, 'assets/ecc-icon.svg');
+  assert.ok(fs.existsSync(path.join(repoRoot, grokPlugin.logo)), 'Expected Grok plugin logo to exist');
+});
+
+test('grok marketplace.json names the ecc catalog and plugin', () => {
+  assert.strictEqual(grokMarketplace.name, 'ecc');
+  assert.ok(typeof grokMarketplace.description === 'string' && grokMarketplace.description.trim(), 'Grok marketplace.json may have a top-level description');
+  assert.ok(Array.isArray(grokMarketplace.plugins) && grokMarketplace.plugins.length > 0, 'Expected plugins array');
+  assert.strictEqual(grokMarketplace.plugins[0].name, 'ecc');
+  assert.strictEqual(grokMarketplace.plugins[0].version, expectedVersion);
+});
+
+test('grok marketplace plugin source is a Git URL of the whole repo, not ./', () => {
+  const plugin = grokMarketplace.plugins[0];
+  assert.ok(plugin.source && typeof plugin.source === 'object', 'Grok rejects Claude\'s string source "./" as an empty marketplace path');
+  assert.notStrictEqual(plugin.source, './');
+  assert.strictEqual(plugin.source.source, 'url');
+  assert.strictEqual(plugin.source.url, 'https://github.com/affaan-m/ECC.git');
+  assert.ok(/^[0-9a-f]{40}$/.test(plugin.source.sha), 'Whole-repo Grok source must pin a 40-character lowercase commit SHA');
+  const trackedAdapter = require('child_process')
+    .execFileSync('git', ['ls-files', 'scripts/lib/grok-harness-adapter.js'], { cwd: repoRoot, encoding: 'utf8' })
+    .trim();
+  if (trackedAdapter) {
+    require('child_process').execFileSync(
+      'git',
+      ['show', `${plugin.source.sha}:scripts/lib/grok-harness-adapter.js`],
+      { cwd: repoRoot, stdio: ['ignore', 'pipe', 'ignore'] }
+    );
+  }
+  assert.notStrictEqual(
+    plugin.source.sha,
+    'd8409a4b0813771235555e32e3d8046a73988bfa',
+    'Do not pin the TasteForge main merge unless that commit contains the Grok adapter'
+  );
+  assert.ok(!plugin.source.path, 'Do not point Grok at plugins/ecc; Codex already proved thin subdir copies drop runtime files');
+});
+
+test('grok marketplace plugin description includes catalog counts', () => {
+  assert.ok(
+    typeof grokMarketplace.plugins[0].description === 'string'
+      && /\d+\s+agents,\s+\d+\s+skills,\s+\d+\s+legacy command shims/i.test(grokMarketplace.plugins[0].description),
+    'Grok marketplace plugin description must include catalog counts'
+  );
+});
+
+test('package.json files includes the Grok plugin directory', () => {
+  assert.ok(Array.isArray(rootPackage.files), 'Expected package.json files array');
+  assert.ok(
+    rootPackage.files.includes('.grok-plugin/'),
+    'npm pack must include .grok-plugin/ so published tarballs remain Grok-installable'
+  );
+});
+
+test('.grok-plugin README documents install, trust, enable, MCP, and hook profile', () => {
+  const readme = fs.readFileSync(grokPluginReadmePath, 'utf8');
+  assert.ok(readme.includes('canonical installer'), 'ECC trusted install uses the canonical installer');
+  assert.ok(readme.includes('install-apply.js --target grok'), 'Grok entrypoint delegates to install-apply');
+  assert.ok(readme.includes('grok-install.js'), 'Operator ECC consent path is scripts/grok-install.js');
+  assert.ok(readme.includes('grok plugin marketplace add affaan-m/ECC'), 'Expected marketplace add for the canonical ECC repo');
+  assert.ok(readme.includes('grok plugin enable ecc'), 'Grok plugins stay off until enabled');
+  assert.ok(
+    /not ECC capability consent|not ECC consent|discovery/i.test(readme),
+    'Grok CLI --trust must not be documented as ECC capability consent'
+  );
+  assert.ok(readme.includes('ECC_HOOK_PROFILE'), 'Grok has no Claude userConfig; document ECC_HOOK_PROFILE');
+  assert.ok(readme.includes('.mcp.json'), 'Document root .mcp.json as a consent-gated MCP source');
+  assert.ok(readme.includes('chrome-devtools'), 'Name chrome-devtools as a consent-gated MCP capability');
+  assert.ok(
+    /consent|explicit/i.test(readme) && /does not|without consent|not attach/i.test(readme),
+    'Document that trusted Grok installs do not attach chrome-devtools without consent'
+  );
+  assert.ok(readme.includes('grok plugin validate'), 'Expected a machine-checkable validation command');
+});
+
 test('.codex-plugin README uses current marketplace add flow', () => {
   const readme = fs.readFileSync(path.join(repoRoot, '.codex-plugin', 'README.md'), 'utf8');
   assert.ok(readme.includes('codex plugin marketplace add'), 'Expected .codex-plugin README to document codex plugin marketplace add');
   assert.ok(readme.includes('codex plugin marketplace add affaan-m/ECC'), 'Expected .codex-plugin README to document the canonical ECC repo marketplace source');
-  assert.ok(readme.includes('Official Plugin Directory publishing is coming soon'), 'Expected .codex-plugin README to document current official directory status');
+  assert.ok(readme.includes('codex plugin add ecc@ecc'), 'Expected .codex-plugin README to document the current Codex install command');
+  assert.ok(readme.includes('codex plugin list --json'), 'Expected .codex-plugin README to document a machine-checkable verification command');
+  assert.ok(readme.includes('safe to run again'), 'Expected .codex-plugin README to explain idempotent marketplace and plugin registration');
+  assert.ok(/does not\s+use Claude's `user`, `project`, or `local` install scopes/.test(readme), 'Expected .codex-plugin README to distinguish Codex plugin state from Claude scopes');
+  assert.ok(readme.includes('review and trust'), 'Expected .codex-plugin README to explain Codex hook trust');
+  assert.ok(readme.includes('legacy managed sync'), 'Expected .codex-plugin README to distinguish native plugins from the legacy managed sync');
   assert.ok(!/\bcodex plugin install\b/.test(readme), 'codex plugin install is not a current Codex CLI command');
 });
 

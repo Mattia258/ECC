@@ -14,6 +14,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { sanitizeSessionId, readBridge, renameWithRetry } = require('../lib/session-bridge');
+const { gateOwnsTranscript } = require('../lib/context-gate-state');
 
 const CONTEXT_WARNING_PCT = 35;
 const CONTEXT_CRITICAL_PCT = 25;
@@ -21,7 +22,12 @@ const COST_NOTICE_USD = 5;
 const COST_WARNING_USD = 10;
 const COST_CRITICAL_USD = 50;
 const FILES_WARNING_COUNT = 20;
-const LOOP_THRESHOLD = 3;
+// The recent_tools ring buffer holds 5 entries (RECENT_TOOLS_SIZE in
+// ecc-metrics-bridge.js), so 5 means ALL of the last 5 calls must be the
+// identical tool+params before a LOOP WARNING fires. At 3, three repeats of
+// a legitimate command (retries, polling) among five mixed calls fired a
+// false warning.
+const LOOP_THRESHOLD = 5;
 const STALE_SECONDS = 60;
 
 function isEnabledEnv(value, defaultValue = true) {
@@ -56,7 +62,7 @@ function readWarnState(sessionId) {
   try {
     return JSON.parse(fs.readFileSync(getWarnPath(sessionId), 'utf8'));
   } catch {
-    return { callsSinceWarn: 0, lastSeverity: null, lastMessage: null };
+    return { callsSinceWarn: 0, lastSeverity: null, lastKey: null };
   }
 }
 
@@ -117,12 +123,22 @@ function evaluateConditions(bridge, options = {}) {
   const warnings = [];
   const remaining = bridge.context_remaining_pct;
 
-  // Context warnings (skip if no context data)
-  if (remaining !== null && remaining !== undefined) {
+  // Defer to the context-gate ONLY when the caller confirmed it is active
+  // (options.gateActive, resolved from the transcript by gateOwnsTranscript):
+  // the critical message below ("ask the user ... do NOT autonomously save
+  // state or write handoff files") directly contradicts the gate's checkpoint
+  // order on the same turns. A gate that cannot evaluate usage (missing or
+  // unreadable transcript) reports inactive, so this warning stays as the
+  // fallback and a low-context session is never left with no guidance.
+  const gateActive = options.gateActive === true;
+
+  // Context warnings (skip if no context data, or if the gate is active)
+  if (remaining !== null && remaining !== undefined && !gateActive) {
     if (remaining <= CONTEXT_CRITICAL_PCT) {
       warnings.push({
         severity: 3,
         type: 'context',
+        dedupeKey: 'context:critical',
         message:
           `CONTEXT CRITICAL: ${remaining}% remaining. Context nearly exhausted. ` +
           'Inform the user that context is low and ask how they want to proceed. ' +
@@ -132,6 +148,7 @@ function evaluateConditions(bridge, options = {}) {
       warnings.push({
         severity: 2,
         type: 'context',
+        dedupeKey: 'context:warning',
         message: `CONTEXT WARNING: ${remaining}% remaining. ` + 'Be aware that context is getting limited. Avoid starting new complex work.'
       });
     }
@@ -144,18 +161,21 @@ function evaluateConditions(bridge, options = {}) {
       warnings.push({
         severity: 3,
         type: 'cost',
+        dedupeKey: 'cost:critical',
         message: `COST CRITICAL: session total ~$${cost.toFixed(2)} (over $${COST_CRITICAL_USD}). Informational only — not an instruction to stop.`
       });
     } else if (cost > COST_WARNING_USD) {
       warnings.push({
         severity: 2,
         type: 'cost',
+        dedupeKey: 'cost:warning',
         message: `COST WARNING: session total ~$${cost.toFixed(2)} (over $${COST_WARNING_USD}). Informational only.`
       });
     } else if (cost > COST_NOTICE_USD) {
       warnings.push({
         severity: 1,
         type: 'cost',
+        dedupeKey: 'cost:notice',
         message: `COST NOTICE: session total ~$${cost.toFixed(2)}. Informational only.`
       });
     }
@@ -167,6 +187,7 @@ function evaluateConditions(bridge, options = {}) {
     warnings.push({
       severity: 2,
       type: 'scope',
+      dedupeKey: 'scope',
       message: `SCOPE WARNING: ${fileCount} files modified this session. ` + 'Consider whether changes are too scattered.'
     });
   }
@@ -177,6 +198,8 @@ function evaluateConditions(bridge, options = {}) {
     warnings.push({
       severity: 2,
       type: 'loop',
+      // The message itself is a stable key: same tool looping again is a
+      // duplicate; a different tool or count is a new event.
       message: `LOOP WARNING: Tool '${loop.tool}' called ${loop.count} times ` + 'with same parameters in last 5 calls. This may indicate a stuck loop.'
     });
   }
@@ -216,7 +239,17 @@ function run(rawInput) {
     // If bridge is stale, null out context data (still check cost/scope/loop)
     const evalBridge = isStale ? { ...bridge, context_remaining_pct: null } : bridge;
 
-    const warnings = evaluateConditions(evalBridge, { costWarnings: costWarningsEnabled() });
+    // Gate deference needs the transcript (gateOwnsTranscript reads real
+    // usage, never the bridge approximation). Only pay that read when a
+    // context warning could actually fire.
+    const transcriptPath = typeof input.transcript_path === 'string' ? input.transcript_path : '';
+    const remainingPct = evalBridge.context_remaining_pct;
+    const contextWarningPossible = remainingPct !== null && remainingPct !== undefined && remainingPct <= CONTEXT_WARNING_PCT;
+
+    const warnings = evaluateConditions(evalBridge, {
+      costWarnings: costWarningsEnabled(),
+      gateActive: contextWarningPossible && gateOwnsTranscript(transcriptPath)
+    });
     if (warnings.length === 0) {
       // Clear dedupe state when the condition resolves, so the SAME warning text
       // recurring later (context dips, recovers, dips again; a loop that stops
@@ -224,37 +257,38 @@ function run(rawInput) {
       // duplicate. Only write when there is state to clear — most tool calls
       // have no warning, and this keeps the common path free of disk writes.
       const prior = readWarnState(sessionId);
-      if (prior.lastMessage) {
-        writeWarnState(sessionId, { callsSinceWarn: 0, lastSeverity: null, lastMessage: null });
+      if (prior.lastKey || prior.lastMessage) {
+        writeWarnState(sessionId, { callsSinceWarn: 0, lastSeverity: null, lastKey: null });
       }
       return rawInput;
     }
 
     // Combine top 2 warnings
-    const message = warnings
-      .slice(0, 2)
-      .map(w => w.message)
-      .join('\n');
+    const top = warnings.slice(0, 2);
+    const message = top.map(w => w.message).join('\n');
 
-    // Dedupe on message content, not a call counter. The previous logic
-    // re-emitted the *same* warning every DEBOUNCE_CALLS tool calls, so a
-    // single unchanged condition (e.g. a cost figure that only refreshes at
-    // turn boundaries) printed the identical line ~20 times in one turn. Now a
-    // warning is surfaced only when its text changes (cost moved, a new file
-    // count, a new loop) or when we newly escalate to critical — genuinely new
-    // information — and is otherwise suppressed.
+    // Dedupe on the warning TIER (dedupeKey), not the message text. Message
+    // text embeds continuously-moving numbers (cost in dollars, context %),
+    // so text-based dedupe re-emitted the "same" warning on nearly every
+    // tool call — a COST NOTICE fired once per call for the rest of the
+    // session once cost passed $5. Each tier now fires once (notice →
+    // warning → critical each re-fire on escalation), and a genuinely new
+    // event (different loop, tier change) still surfaces.
+    const dedupeKey = top.map(w => w.dedupeKey || w.message).join('\n');
     const warnState = readWarnState(sessionId);
     const topSeverity = severityLabel(warnings[0].severity);
     const escalatedToCritical = topSeverity === 'critical' && warnState.lastSeverity !== 'critical';
-    const sameMessage = warnState.lastMessage === message;
+    const sameKey = warnState.lastKey === dedupeKey;
 
-    if (sameMessage && !escalatedToCritical) {
+    if (sameKey && !escalatedToCritical) {
       return rawInput;
     }
 
-    warnState.lastSeverity = topSeverity;
-    warnState.lastMessage = message;
-    writeWarnState(sessionId, warnState);
+    writeWarnState(sessionId, {
+      ...warnState,
+      lastSeverity: topSeverity,
+      lastKey: dedupeKey,
+    });
 
     const output = {
       hookSpecificOutput: {

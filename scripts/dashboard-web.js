@@ -6,12 +6,46 @@
  * Usage: node scripts/dashboard-web.js [port]
  * Open http://localhost:3456
  *
+ * The server only binds to loopback and has no authentication, by design --
+ * it is meant to be viewed on the same machine it runs on. To check it from
+ * another device you control (a tablet, a laptop), use standard SSH local
+ * port forwarding instead of exposing the port itself:
+ *   ssh -L 3456:127.0.0.1:3456 <user>@<this-machine> -p <ssh-port>
+ * then open http://127.0.0.1:3456 on the *remote* device. This requires
+ * only SSH access you already control on your own machine -- nothing here
+ * opens the dashboard to the network.
+ *
  * Contribution: https://github.com/affaan-m/ECC
  */
 
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const { spawn } = require('child_process');
+const {
+  LOOPBACK_HOSTNAMES,
+  buildAllowedHostnames,
+  isAllowedHostHeader,
+  isAllowedOrigin,
+} = require('./lib/loopback-guard');
+const { normalizeAgentTools } = require('./lib/agent-tools');
+const { readHooksConfig } = require('./lib/hooks-config');
+const { getClaudeDir } = require('./lib/utils');
+const { openBrowser } = require('./lib/platform-launch');
+
+const DEFAULT_HOST = '127.0.0.1';
+
+function resolveDashboardHost(env = process.env) {
+  const configured = String(env.ECC_DASHBOARD_HOST || '').trim().toLowerCase();
+  if (!configured) return DEFAULT_HOST;
+  if (!LOOPBACK_HOSTNAMES.has(configured)) {
+    throw new Error(
+      '[ECC] ECC_DASHBOARD_HOST must be loopback-only ' +
+      '(127.0.0.1, localhost, or ::1).'
+    );
+  }
+  return configured === '[::1]' ? '::1' : configured;
+}
 
 function parsePort(v) {
   const n = parseInt(String(v), 10);
@@ -19,11 +53,10 @@ function parsePort(v) {
   return n;
 }
 const PORT = parsePort(process.argv[2] || process.env.ECC_DASHBOARD_PORT || '3456');
+const HOST = resolveDashboardHost();
 const ROOT = path.resolve(__dirname, '..');
 
-function readFrontmatter(p) {
-  try {
-    const c = fs.readFileSync(p, 'utf8');
+function parseFrontmatter(c) {
     const m = c.match(/^---\n([\s\S]*?)\n---/);
     if (!m) return {};
     const fm = {};
@@ -31,14 +64,27 @@ function readFrontmatter(p) {
       const s = l.indexOf(':'); if (s <= 0) continue;
       let k = l.slice(0, s).trim(), v = l.slice(s + 1).trim();
       if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
-      if (v.startsWith('[') && v.endsWith(']')) { try { v = JSON.parse(v); } catch { v = v.slice(1, -1).split(',').map(x => x.trim().replace(/["']/g, '')); } }
+      if (k === 'tools') {
+        v = normalizeAgentTools(v);
+      } else if (v.startsWith('[') && v.endsWith(']')) {
+        try { v = JSON.parse(v); } catch { v = v.slice(1, -1).split(',').map(x => x.trim().replace(/["']/g, '')); }
+      }
       fm[k] = v;
     }
     fm._body = c.replace(/^---[\s\S]*?---\n*/, '').trim();
     return fm;
-  } catch { return {}; }
 }
-function readSkill(p) { try { const c = fs.readFileSync(p, 'utf8'); const fm = readFrontmatter(p); return { d: fm.description || '', b: c.replace(/^---[\s\S]*?---\n*/, '').trim() }; } catch { return { d: '', b: '' }; } }
+function readFrontmatter(p) {
+  try { return parseFrontmatter(fs.readFileSync(p, 'utf8')); }
+  catch { return {}; }
+}
+function readSkill(p) {
+  try {
+    const c = fs.readFileSync(p, 'utf8');
+    const fm = parseFrontmatter(c);
+    return { d: fm.description || '', b: c.replace(/^---[\s\S]*?---\n*/, '').trim() };
+  } catch { return { d: '', b: '' }; }
+}
 
 function loadAgents(_root) {
   const root = _root || ROOT;
@@ -103,7 +149,9 @@ function loadHooks(_root) {
   const hooksPath = path.join(root, 'hooks', 'hooks.json');
   if (!fs.existsSync(hooksPath)) return [];
   try {
-    const data = JSON.parse(fs.readFileSync(hooksPath, 'utf8'));
+    // Ids and descriptions live in hooks/hooks.metadata.json so that hooks.json
+    // stays within the key set Claude Code's hooks schema accepts.
+    const data = readHooksConfig(hooksPath);
     const hooks = [];
     for (const [eventName, entries] of Object.entries(data.hooks || {})) {
       for (const entry of entries || []) {
@@ -408,6 +456,7 @@ function renderHTML(data) {
   <button class="nav-it" data-tab="rules" onclick="showTab('rules',this)"><span id="nav-rules"> Rules</span> <span class="ct" id="nav-ct-rules"></span></button>
   <button class="nav-it" data-tab="mcps" onclick="showTab('mcps',this)"><span id="nav-mcps"> MCPs</span> <span class="ct" id="nav-ct-mcps"></span></button>
   <button class="nav-it" data-tab="hooks" onclick="showTab('hooks',this)"><span id="nav-hooks"> Hooks</span> <span class="ct" id="nav-ct-hooks"></span></button>
+  <button class="nav-it" data-tab="activity" onclick="showTab('activity',this)"><span id="nav-activity"> Activity</span> <span class="ct" id="nav-ct-activity">live</span></button>
 </div>
 
 <div class="out" id="app"></div>
@@ -533,7 +582,7 @@ window.addEventListener('hashchange', handleRoute);
 // Render Main Dashboard
 function renderMain() {
   const app = document.getElementById('app');
-  app.innerHTML = '<div class="stats" id="stats-bar"></div><div class="panel active" id="panel-agents"></div><div class="panel" id="panel-skills"></div><div class="panel" id="panel-commands"></div><div class="panel" id="panel-rules"></div><div class="panel" id="panel-mcps"></div><div class="panel" id="panel-hooks"></div>';
+  app.innerHTML = '<div class="stats" id="stats-bar"></div><div class="panel active" id="panel-agents"></div><div class="panel" id="panel-skills"></div><div class="panel" id="panel-commands"></div><div class="panel" id="panel-rules"></div><div class="panel" id="panel-mcps"></div><div class="panel" id="panel-hooks"></div><div class="panel" id="panel-activity"></div>';
 
   document.getElementById('stats-bar').innerHTML =
     '<div class="stat c0" onclick="showTab(\\'agents\\',document.querySelector(\\'.nav-it[data-tab=\\\\"agents\\\"]\\'))"><div class="num">'+AGENTS.length+'</div><div class="lbl">'+t('agents')+'</div></div>' +
@@ -782,25 +831,298 @@ document.addEventListener('keydown', e => { if((e.metaKey||e.ctrlKey)&&e.key==='
 setLang(lang);
 handleRoute();
 </script>
+<script>
+(function () {
+  var TOOL_KIND = { Skill: 'kind-skill', Agent: 'kind-agent' };
+  var timer = null;
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
+  function rowHtml(e) {
+    var kindClass = TOOL_KIND[e.tool_name] || 'kind-plain';
+    var time = '';
+    try { time = new Date(e.timestamp).toLocaleTimeString(); } catch (err) { time = ''; }
+    return '<div class="act-row ' + kindClass + '">' +
+      '<span class="act-time">' + esc(time) + '</span>' +
+      '<span class="act-tool">' + esc(e.tool_name) + '</span>' +
+      '<span class="act-summary">' + esc(e.input_summary) + '</span>' +
+      '<span class="act-session">' + esc((e.session_id || '').slice(0, 8)) + '</span>' +
+      '</div>';
+  }
+
+  function renderActivity() {
+    var panel = document.getElementById('panel-activity');
+    if (!panel) return;
+    fetch('/api/activity')
+      .then(function (r) {
+        if (!r.ok) throw new Error('Activity request failed');
+        return r.json();
+      })
+      .then(function (data) {
+        var entries = (data && data.entries) || [];
+        var skillCount = entries.filter(function (e) { return e.tool_name === 'Skill'; }).length;
+        var agentCount = entries.filter(function (e) { return e.tool_name === 'Agent'; }).length;
+        var summary = '<div class="act-summary-bar">' +
+          '<span>Last ' + entries.length + ' tool calls</span>' +
+          '<span class="act-pill act-pill-skill">Skill: ' + skillCount + '</span>' +
+          '<span class="act-pill act-pill-agent">Agent: ' + agentCount + '</span>' +
+          '</div>';
+        if (!entries.length) {
+          panel.innerHTML = summary + '<div class="act-empty">No recorded tool calls yet. This reads metrics/tool-usage.jsonl in the active ECC agent data directory, written by the session-activity-tracker PostToolUse hook. Requires that hook in the active session.</div>';
+          return;
+        }
+        panel.innerHTML = summary + '<div class="act-feed">' + entries.map(rowHtml).join('') + '</div>';
+      })
+      .catch(function () {
+        panel.innerHTML = '<div class="act-empty">Could not load activity feed.</div>';
+      });
+  }
+
+  var style = document.createElement('style');
+  style.textContent =
+    '.act-summary-bar{display:flex;gap:12px;align-items:center;padding:10px 0;font-size:13px;color:var(--muted,#888)}' +
+    '.act-pill{padding:2px 8px;border-radius:10px;font-size:12px;font-weight:600}' +
+    '.act-pill-skill{background:rgba(80,160,255,.15);color:#4a9eff}' +
+    '.act-pill-agent{background:rgba(160,100,255,.15);color:#a066ff}' +
+    '.act-feed{display:flex;flex-direction:column;gap:2px;font-family:ui-monospace,monospace;font-size:12.5px}' +
+    '.act-row{display:grid;grid-template-columns:90px 90px 1fr 90px;gap:10px;padding:5px 8px;border-radius:4px;align-items:center}' +
+    '.act-row.kind-skill{background:rgba(80,160,255,.08)}' +
+    '.act-row.kind-agent{background:rgba(160,100,255,.08)}' +
+    '.act-time{opacity:.6}' +
+    '.act-tool{font-weight:600}' +
+    '.act-summary{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.85}' +
+    '.act-session{opacity:.5;text-align:right}' +
+    '.act-empty{padding:24px 8px;opacity:.6;font-size:13px}';
+  document.head.appendChild(style);
+
+  var origShowTab = window.showTab;
+  window.showTab = function (name, btn) {
+    origShowTab(name, btn);
+    if (name === 'activity') {
+      renderActivity();
+      if (timer) clearInterval(timer);
+      timer = setInterval(renderActivity, 3000);
+    } else if (timer) {
+      clearInterval(timer);
+      timer = null;
+    }
+  };
+})();
+</script>
 </body></html>`;
   /* eslint-enable no-useless-escape */
 }
 
-const server = http.createServer((req, res) => {
-  const url = new URL(req.url, 'http://localhost');
-  if (url.pathname === '/api/data') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ agents: loadAgents(), skills: loadSkills(), commands: loadCommands(), rules: loadRules(), mcps: loadMcps(), hooks: loadHooks() }));
-  }
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-  res.end(renderHTML({ agents: loadAgents(), skills: loadSkills(), commands: loadCommands(), rules: loadRules(), mcps: loadMcps(), hooks: loadHooks() }));
-});
+function sendJson(res, statusCode, payload) {
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-store',
+  });
+  res.end(JSON.stringify(payload));
+}
 
-if (require.main === module) {
-  server.listen(PORT, () => {
-    console.log(`\n    ECC Capabilities  →  http://localhost:${PORT}\n`);
-    try { const { spawn } = require('child_process'); const p = process.platform; const c = p === 'darwin' ? 'open' : p === 'win32' ? 'start' : 'xdg-open'; if (c === 'start') spawn('cmd', ['/c', 'start', `http://localhost:${PORT}`], { stdio: 'ignore' }); else spawn(c, [`http://localhost:${PORT}`], { stdio: 'ignore' }); } catch { /* best-effort auto-open */ }
+function sendHtml(res, statusCode, html) {
+  res.writeHead(statusCode, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+  });
+  res.end(html);
+}
+
+const MAX_ACTIVITY_LOG_BYTES = 256 * 1024;
+
+function loadActivity(limit = 200, logPath = path.join(getClaudeDir(), 'metrics', 'tool-usage.jsonl')) {
+  let fd;
+  let text;
+  try {
+    fd = fs.openSync(logPath, 'r');
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) return [];
+    const length = Math.min(stat.size, MAX_ACTIVITY_LOG_BYTES);
+    const start = stat.size - length;
+    const buffer = Buffer.alloc(length);
+    const bytesRead = fs.readSync(fd, buffer, 0, length, start);
+    text = buffer.toString('utf8', 0, bytesRead);
+    // A bounded tail may start inside a JSON row or a multibyte character.
+    if (start > 0) text = text.slice(text.indexOf('\n') + 1);
+  } catch {
+    return [];
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+  const lines = text.split('\n').filter(Boolean);
+  const start = Math.max(0, lines.length - limit);
+  const out = [];
+  for (let i = lines.length - 1; i >= start; i -= 1) {
+    try {
+      const row = JSON.parse(lines[i]);
+      if (row && !Array.isArray(row) && typeof row.session_id === 'string' && typeof row.tool_name === 'string') {
+        out.push(row);
+      }
+    } catch {
+      // Skip unparseable lines rather than fail the whole feed.
+    }
+  }
+  return out;
+}
+
+function loadDashboardData(root) {
+  return {
+    agents: loadAgents(root),
+    skills: loadSkills(root),
+    commands: loadCommands(root),
+    rules: loadRules(root),
+    mcps: loadMcps(root),
+    hooks: loadHooks(root),
+  };
+}
+
+function defaultReportError(message, error) {
+  console.error(message, error);
+}
+
+function reportDashboardFailure(reportError, message, error) {
+  try {
+    reportError(message, error);
+  } catch {
+    // Error reporting must never prevent the generic HTTP response.
+  }
+}
+
+function createDashboardServer({
+  root = ROOT,
+  host = HOST,
+  loadData = loadDashboardData,
+  render = renderHTML,
+  reportError = defaultReportError,
+} = {}) {
+  const resolvedHost = resolveDashboardHost({ ECC_DASHBOARD_HOST: host });
+  const allowedHostnames = buildAllowedHostnames(resolvedHost);
+
+  return http.createServer((req, res) => {
+    if (!isAllowedHostHeader(req.headers.host, allowedHostnames)) {
+      return sendJson(res, 421, { error: 'Misdirected request' });
+    }
+    if (!isAllowedOrigin(req.headers.origin, allowedHostnames)) {
+      return sendJson(res, 403, { error: 'Forbidden origin' });
+    }
+
+    let url;
+    try {
+      url = new URL(req.url, `http://${DEFAULT_HOST}`);
+    } catch {
+      return sendJson(res, 400, { error: 'Bad request' });
+    }
+
+    if (url.pathname === '/api/activity') {
+      let entries;
+      try {
+        entries = loadActivity();
+      } catch (error) {
+        reportDashboardFailure(
+          reportError,
+          '[ECC] Failed to load activity log:',
+          error
+        );
+        return sendJson(res, 500, { error: 'Internal server error' });
+      }
+      return sendJson(res, 200, { entries });
+    }
+
+    if (url.pathname === '/api/data') {
+      let data;
+      try {
+        data = loadData(root);
+      } catch (error) {
+        reportDashboardFailure(
+          reportError,
+          '[ECC] Failed to load dashboard data:',
+          error
+        );
+        return sendJson(res, 500, { error: 'Internal server error' });
+      }
+      return sendJson(res, 200, data);
+    }
+
+    let html;
+    try {
+      html = render(loadData(root));
+    } catch (error) {
+      reportDashboardFailure(
+        reportError,
+        '[ECC] Failed to render dashboard:',
+        error
+      );
+      return sendHtml(
+        res,
+        500,
+        '<!DOCTYPE html><p>Dashboard unavailable.</p>'
+      );
+    }
+    return sendHtml(res, 200, html);
   });
 }
 
-module.exports = { parsePort, readFrontmatter, readSkill, loadAgents, loadSkills, loadCommands, loadRules, loadMcps, loadHooks, renderHTML, LANG, LANG_KEYS, server };
+function listenDashboardServer(
+  dashboardServer,
+  { port = PORT, host = HOST, onListening } = {}
+) {
+  const resolvedHost = resolveDashboardHost({ ECC_DASHBOARD_HOST: host });
+  return dashboardServer.listen(port, resolvedHost, onListening);
+}
+
+// Best-effort auto-open. openBrowser() handles the launcher's async 'error'
+// event so a missing xdg-open/open leaves the server running; the wrapped
+// spawn surfaces that failure so headless users know why no browser opened.
+function openDashboardInBrowser(url) {
+  let reported = false;
+  const reportFailure = (reason) => {
+    if (reported) return;
+    reported = true;
+    console.error(`[ECC] Could not open a browser automatically (${reason}); open ${url} manually.`);
+  };
+  const result = openBrowser(url, process.platform, (command, args, options) => {
+    const child = spawn(command, args, options);
+    child.once('error', err => reportFailure(err && err.code ? err.code : 'spawn-error'));
+    return child;
+  });
+  if (!result.opened) reportFailure(result.reason);
+  return result;
+}
+
+const server = createDashboardServer();
+
+if (require.main === module) {
+  listenDashboardServer(server, { port: PORT, host: HOST, onListening: () => {
+    const displayHost = HOST.includes(':') ? `[${HOST}]` : HOST;
+    const dashboardUrl = `http://${displayHost}:${PORT}`;
+    console.log(`\n    ECC Capabilities  →  ${dashboardUrl}\n`);
+    openDashboardInBrowser(dashboardUrl);
+  } });
+}
+
+module.exports = {
+  DEFAULT_HOST,
+  HOST,
+  LANG,
+  LANG_KEYS,
+  createDashboardServer,
+  listenDashboardServer,
+  loadAgents,
+  loadActivity,
+  loadCommands,
+  loadHooks,
+  loadMcps,
+  loadRules,
+  loadSkills,
+  parsePort,
+  readFrontmatter,
+  readSkill,
+  renderHTML,
+  resolveDashboardHost,
+  server,
+};

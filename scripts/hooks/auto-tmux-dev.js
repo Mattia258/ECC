@@ -27,6 +27,7 @@
 
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { isDevServerCommand } = require('../lib/dev-command');
 
 const MAX_STDIN = 1024 * 1024; // 1MB limit
 let data = '';
@@ -36,11 +37,12 @@ function run(rawInput) {
     const input = typeof rawInput === 'string' ? JSON.parse(rawInput) : rawInput;
     const cmd = input.tool_input?.command || '';
 
-    // Detect dev server commands: npm run dev, pnpm dev, yarn dev, bun run dev
-    // Use word boundary (\b) to avoid matching partial commands
-    const devServerRegex = /(npm run dev\b|pnpm( run)? dev\b|yarn dev\b|bun run dev\b)/;
-
-    if (devServerRegex.test(cmd)) {
+    // Detect dev server commands through the shared classifier
+    // (scripts/lib/dev-command.js) rather than a private regex. This hook and
+    // pre-bash-dev-server-block.js must agree exactly — one refuses the command
+    // outside tmux, the other is what puts it in tmux — and two copies of a
+    // regex asking each other to stay identical is how they drift.
+    if (isDevServerCommand(cmd)) {
       // Get session name from current directory basename, sanitize for shell safety
       // e.g., /home/user/Portfolio → "Portfolio", /home/user/my-app-v2 → "my-app-v2"
       const rawName = path.basename(process.cwd());

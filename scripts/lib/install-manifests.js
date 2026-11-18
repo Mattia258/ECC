@@ -2,9 +2,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { getInstallTargetAdapter, planInstallTargetScaffold } = require('./install-targets/registry');
+const { resolveInvocationEnvironment } = require('./invocation-environment');
 
 const DEFAULT_REPO_ROOT = path.join(__dirname, '../..');
-const SUPPORTED_INSTALL_TARGETS = ['claude', 'claude-project', 'cursor', 'antigravity', 'codex', 'gemini', 'opencode', 'codebuddy', 'joycode', 'qwen', 'zed', 'hermes', 'openclaw', 'kimi'];
+const SUPPORTED_INSTALL_TARGETS = ['claude', 'claude-project', 'cursor', 'antigravity', 'antigravity-home', 'codex', 'copilot', 'gemini', 'opencode', 'codebuddy', 'joycode', 'qwen', 'zed', 'hermes', 'openclaw', 'kimi', 'adal', 'grok', 'mistral-vibe'];
 const COMPONENT_FAMILY_PREFIXES = {
   baseline: 'baseline:',
   language: 'lang:',
@@ -14,7 +15,7 @@ const COMPONENT_FAMILY_PREFIXES = {
   skill: 'skill:',
   locale: 'locale:',
 };
-const SUPPORTED_LOCALES = Object.freeze(['ja', 'zh-CN', 'ko-KR', 'pt-BR', 'ru', 'tr', 'vi-VN', 'zh-TW', 'de-DE']);
+const SUPPORTED_LOCALES = Object.freeze(['ja', 'zh-CN', 'ko-KR', 'pt-BR', 'ru', 'tr', 'vi-VN', 'zh-TW', 'de-DE', 'uk-UA', 'pl', 'bn', 'ar']);
 const LOCALE_ALIAS_TO_COMPONENT_ID = Object.freeze({
   'ja': 'locale:ja',
   'ja-JP': 'locale:ja',
@@ -31,6 +32,14 @@ const LOCALE_ALIAS_TO_COMPONENT_ID = Object.freeze({
   'zh-TW': 'locale:zh-tw',
   'de-DE': 'locale:de-de',
   'de': 'locale:de-de',
+  'uk-UA': 'locale:uk-ua',
+  'uk': 'locale:uk-ua',
+  'pl': 'locale:pl',
+  'pl-PL': 'locale:pl',
+  'bn': 'locale:bn',
+  'bn-BD': 'locale:bn',
+  'ar': 'locale:ar',
+  'ar-SA': 'locale:ar'
 });
 
 function listSupportedLocales() {
@@ -65,6 +74,16 @@ const LEGACY_COMPAT_BASE_MODULE_IDS_BY_TARGET = Object.freeze({
     'rules-core',
     'agents-core',
     'commands-core',
+    'skill-unified-memory',
+    'workflow-quality',
+  ],
+  'antigravity-home': [
+    'rules-core',
+    'agents-core',
+    'commands-core',
+    'hooks-runtime',
+    'platform-configs',
+    'workflow-quality',
   ],
   zed: [
     'rules-core',
@@ -88,6 +107,13 @@ const LEGACY_COMPAT_BASE_MODULE_IDS_BY_TARGET = Object.freeze({
     'workflow-quality',
   ],
   kimi: [
+    'rules-core',
+    'agents-core',
+    'commands-core',
+    'platform-configs',
+    'workflow-quality',
+  ],
+  adal: [
     'rules-core',
     'agents-core',
     'commands-core',
@@ -132,6 +158,14 @@ const LEGACY_LANGUAGE_EXTRA_MODULE_IDS = Object.freeze({
   swift: [],
   typescript: ['framework-language'],
 });
+const LEGACY_LANGUAGE_RULE_NAMESPACES = Object.freeze({
+  c: 'cpp',
+  harmonyos: 'arkts',
+  javascript: 'typescript',
+  go: 'golang',
+  golang: 'golang',
+  rails: 'ruby',
+});
 const TARGET_DEFAULT_PROFILE_IDS = Object.freeze({
   opencode: 'opencode',
 });
@@ -169,42 +203,58 @@ function listSkillDirectoryIds(repoRoot) {
     .sort();
 }
 
-function addSyntheticSkillComponents({ repoRoot, modules, components }) {
-  const moduleIds = new Set(modules.map(module => module.id));
+function addSyntheticSkillComponents({ repoRoot, modules, components, target = null }) {
+  const originalModuleIds = new Set(modules.map(module => module.id));
   const componentIds = new Set(components.map(component => component.id));
+  const syntheticModules = [];
+  const syntheticComponents = [];
 
   for (const skillId of listSkillDirectoryIds(repoRoot)) {
     const componentId = `skill:${skillId}`;
+    const needsTargetSpecificModule = target === 'mistral-vibe';
+    if (componentIds.has(componentId) && !needsTargetSpecificModule) {
+      continue;
+    }
+    const moduleId = `skill-${skillId}`;
+    const exactSkillModule = {
+      id: moduleId,
+      kind: 'skills',
+      description: `Single-skill install surface for ${skillId}.`,
+      paths: [`skills/${skillId}`],
+      targets: needsTargetSpecificModule
+        ? ['mistral-vibe']
+        : SUPPORTED_INSTALL_TARGETS.slice(),
+      dependencies: [],
+      defaultInstall: false,
+      cost: 'light',
+      stability: 'stable',
+      synthetic: true,
+    };
+    if (needsTargetSpecificModule || !originalModuleIds.has(moduleId)) {
+      syntheticModules.push(exactSkillModule);
+    }
+
     if (componentIds.has(componentId)) {
       continue;
     }
 
-    const moduleId = `skill-${skillId}`;
-    if (!moduleIds.has(moduleId)) {
-      modules.push({
-        id: moduleId,
-        kind: 'skills',
-        description: `Single-skill install surface for ${skillId}.`,
-        paths: [`skills/${skillId}`],
-        targets: SUPPORTED_INSTALL_TARGETS.slice(),
-        dependencies: [],
-        defaultInstall: false,
-        cost: 'light',
-        stability: 'stable',
-        synthetic: true,
-      });
-      moduleIds.add(moduleId);
-    }
-
-    components.push({
+    syntheticComponents.push({
       id: componentId,
       family: 'skill',
       description: `Install only the ${skillId} skill directory.`,
       modules: [moduleId],
       synthetic: true,
     });
-    componentIds.add(componentId);
   }
+
+  const replacementModuleIds = new Set(syntheticModules.map(module => module.id));
+  return {
+    modules: [
+      ...modules.filter(module => !replacementModuleIds.has(module.id)),
+      ...syntheticModules,
+    ],
+    components: [...components, ...syntheticComponents],
+  };
 }
 
 function readOptionalStringOption(options, key) {
@@ -272,6 +322,21 @@ function intersectTargets(modules) {
   ));
 }
 
+function getComponentModuleIds(component, manifests, target = null) {
+  const skillId = component.id.startsWith(COMPONENT_FAMILY_PREFIXES.skill)
+    ? component.id.slice(COMPONENT_FAMILY_PREFIXES.skill.length)
+    : null;
+  const exactSkillModuleId = skillId ? `skill-${skillId}` : null;
+  if (
+    target === 'mistral-vibe'
+    && exactSkillModuleId
+    && manifests.modulesById.has(exactSkillModuleId)
+  ) {
+    return [exactSkillModuleId];
+  }
+  return dedupeStrings(component.modules);
+}
+
 function getManifestPaths(repoRoot = DEFAULT_REPO_ROOT) {
   return {
     modulesPath: path.join(repoRoot, 'manifests', 'install-modules.json'),
@@ -299,23 +364,36 @@ function loadInstallManifests(options = {}) {
     : {};
   const components = Array.isArray(componentsData.components) ? componentsData.components.slice() : [];
 
-  addSyntheticSkillComponents({ repoRoot, modules, components });
+  const withSyntheticSkills = addSyntheticSkillComponents({
+    repoRoot,
+    modules,
+    components,
+    target: options.target || null,
+  });
+  const resolvedModules = withSyntheticSkills.modules;
+  const resolvedComponents = withSyntheticSkills.components;
 
-  for (const module of modules) {
+  for (const module of resolvedModules) {
     readModuleTargetsOrThrow(module);
+    if (module.optionalDependencies !== undefined && (
+      !Array.isArray(module.optionalDependencies)
+      || module.optionalDependencies.some(id => !module.dependencies.includes(id))
+    )) {
+      throw new Error(`Install module ${module.id} optionalDependencies must be an array of declared dependency ids`);
+    }
   }
 
-  const modulesById = new Map(modules.map(module => [module.id, module]));
-  const componentsById = new Map(components.map(component => [component.id, component]));
+  const modulesById = new Map(resolvedModules.map(module => [module.id, module]));
+  const componentsById = new Map(resolvedComponents.map(component => [component.id, component]));
 
   return {
     repoRoot,
     modulesPath,
     profilesPath,
     componentsPath,
-    modules,
+    modules: resolvedModules,
     profiles,
-    components,
+    components: resolvedComponents,
     modulesById,
     componentsById,
     modulesVersion: modulesData.version,
@@ -378,7 +456,7 @@ function listInstallComponents(options = {}) {
   return manifests.components
     .filter(component => !family || component.family === family)
     .map(component => {
-      const moduleIds = dedupeStrings(component.modules);
+      const moduleIds = getComponentModuleIds(component, manifests, target);
       const modules = moduleIds
         .map(moduleId => manifests.modulesById.get(moduleId))
         .filter(Boolean);
@@ -409,7 +487,7 @@ function getInstallComponent(componentId, options = {}) {
     throw new Error(`Unknown install component: ${normalizedComponentId}`);
   }
 
-  const moduleIds = dedupeStrings(component.modules);
+  const moduleIds = getComponentModuleIds(component, manifests, options.target || null);
   const modules = moduleIds
     .map(moduleId => manifests.modulesById.get(moduleId))
     .filter(Boolean)
@@ -435,7 +513,7 @@ function getInstallComponent(componentId, options = {}) {
   };
 }
 
-function expandComponentIdsToModuleIds(componentIds, manifests) {
+function expandComponentIdsToModuleIds(componentIds, manifests, options = {}) {
   const expandedModuleIds = [];
 
   for (const componentId of dedupeStrings(componentIds)) {
@@ -443,7 +521,11 @@ function expandComponentIdsToModuleIds(componentIds, manifests) {
     if (!component) {
       throw new Error(`Unknown install component: ${componentId}`);
     }
-    expandedModuleIds.push(...component.modules);
+    expandedModuleIds.push(...getComponentModuleIds(
+      component,
+      manifests,
+      options.target || null
+    ));
   }
 
   return dedupeStrings(expandedModuleIds);
@@ -500,6 +582,9 @@ function resolveLegacyCompatibilitySelection(options = {}) {
 
   const canonicalLegacyLanguages = normalizedLegacyLanguages
     .map(language => LEGACY_LANGUAGE_ALIAS_TO_CANONICAL[language]);
+  const ruleLanguages = normalizedLegacyLanguages.map(language => (
+    LEGACY_LANGUAGE_RULE_NAMESPACES[language] || language
+  ));
   const baseModuleIds = LEGACY_COMPAT_BASE_MODULE_IDS_BY_TARGET[target || 'claude']
     || LEGACY_COMPAT_BASE_MODULE_IDS_BY_TARGET.claude;
   const moduleIds = dedupeStrings([
@@ -514,18 +599,25 @@ function resolveLegacyCompatibilitySelection(options = {}) {
   return {
     legacyLanguages: normalizedLegacyLanguages,
     canonicalLegacyLanguages,
+    ruleLanguages,
     moduleIds,
   };
 }
 
 function resolveInstallPlan(options = {}) {
-  const manifests = loadInstallManifests(options);
+  const target = options.target || null;
+  const manifests = loadInstallManifests({ ...options, target });
   const requestedProfileId = options.profileId || null;
   const explicitModuleIds = dedupeStrings(options.moduleIds);
   const includedComponentIds = dedupeStrings(options.includeComponentIds);
   const excludedComponentIds = dedupeStrings(options.excludeComponentIds);
   const requestedModuleIds = [];
-  const target = options.target || null;
+
+  if (target === 'mistral-vibe' && requestedProfileId) {
+    throw new Error(
+      'Mistral Vibe currently supports explicit Agent Skill installs only; use --skills <id,...> instead of a profile.'
+    );
+  }
 
   if (target && !SUPPORTED_INSTALL_TARGETS.includes(target)) {
     throw new Error(
@@ -553,16 +645,24 @@ function resolveInstallPlan(options = {}) {
   }
 
   requestedModuleIds.push(...explicitModuleIds);
-  requestedModuleIds.push(...expandComponentIdsToModuleIds(includedComponentIds, manifests));
+  requestedModuleIds.push(...expandComponentIdsToModuleIds(
+    includedComponentIds,
+    manifests,
+    { target }
+  ));
 
-  const excludedModuleIds = expandComponentIdsToModuleIds(excludedComponentIds, manifests);
+  const excludedModuleIds = expandComponentIdsToModuleIds(
+    excludedComponentIds,
+    manifests,
+    { target }
+  );
   const excludedModuleOwners = new Map();
   for (const componentId of excludedComponentIds) {
     const component = manifests.componentsById.get(componentId);
     if (!component) {
       throw new Error(`Unknown install component: ${componentId}`);
     }
-    for (const moduleId of component.modules) {
+    for (const moduleId of getComponentModuleIds(component, manifests, target)) {
       const owners = excludedModuleOwners.get(moduleId) || [];
       owners.push(componentId);
       excludedModuleOwners.set(moduleId, owners);
@@ -581,6 +681,10 @@ function resolveInstallPlan(options = {}) {
       repoRoot: manifests.repoRoot,
       projectRoot: validatedProjectRoot || manifests.repoRoot,
       homeDir: validatedHomeDir || os.homedir(),
+      env: resolveInvocationEnvironment(options),
+      trust: options.trust === true,
+      consent: options.consent || {},
+      sourceSha: options.sourceSha || null,
     }
     : null;
   const targetAdapter = target ? getInstallTargetAdapter(target) : null;
@@ -590,6 +694,11 @@ function resolveInstallPlan(options = {}) {
   );
 
   if (requestedModuleIds.length === 0) {
+    if (target === 'mistral-vibe') {
+      throw new Error(
+        'Mistral Vibe currently supports explicit Agent Skill installs only; use --skills <id,...>.'
+      );
+    }
     throw new Error('No install profile, module IDs, or included component IDs were provided');
   }
 
@@ -606,7 +715,7 @@ function resolveInstallPlan(options = {}) {
   const visitingIds = new Set();
   const resolvedIds = new Set();
 
-  function resolveModule(moduleId, dependencyOf, rootRequesterId) {
+  function resolveModule(moduleId, dependencyOf, optional = false) {
     const module = manifests.modulesById.get(moduleId);
     if (!module) {
       throw new Error(`Unknown install module: ${moduleId}`);
@@ -624,14 +733,16 @@ function resolveInstallPlan(options = {}) {
 
     const supportsTarget = !target
       || (
-        readModuleTargetsOrThrow(module).includes(target)
+        (readModuleTargetsOrThrow(module).includes(target)
+          || targetAdapter?.acceptsUndeclaredModuleTargets === true)
         && (!targetAdapter || targetAdapter.supportsModule(module, targetPlanningInput))
       );
 
     if (!supportsTarget) {
       if (dependencyOf) {
-        skippedTargetIds.add(rootRequesterId || dependencyOf);
-        return false;
+        // Only explicitly optional edges may be omitted for this target.
+        skippedTargetIds.add(moduleId);
+        return optional;
       }
       skippedTargetIds.add(moduleId);
       return false;
@@ -650,35 +761,56 @@ function resolveInstallPlan(options = {}) {
       const dependencyResolved = resolveModule(
         dependencyId,
         moduleId,
-        rootRequesterId || moduleId
+        (module.optionalDependencies || []).includes(dependencyId)
       );
       if (!dependencyResolved) {
         visitingIds.delete(moduleId);
-        if (!dependencyOf) {
-          skippedTargetIds.add(moduleId);
-        }
+        skippedTargetIds.add(moduleId);
         return false;
       }
     }
     visitingIds.delete(moduleId);
     resolvedIds.add(moduleId);
-    selectedIds.add(moduleId);
     return true;
   }
 
+  // Resolution may visit supported dependencies before a later required edge fails.
+  // Select only the closure of successful requests, so failed requests leave no
+  // orphan modules while shared dependencies remain available to successful ones.
+  function selectResolvedModule(moduleId) {
+    if (!resolvedIds.has(moduleId) || selectedIds.has(moduleId)) {
+      return;
+    }
+    selectedIds.add(moduleId);
+    for (const dependencyId of manifests.modulesById.get(moduleId).dependencies) {
+      selectResolvedModule(dependencyId);
+    }
+  }
+
   for (const moduleId of effectiveRequestedIds) {
-    resolveModule(moduleId, null, moduleId);
+    if (resolveModule(moduleId, null)) {
+      selectResolvedModule(moduleId);
+    }
   }
 
   const selectedModules = manifests.modules.filter(module => selectedIds.has(module.id));
   const skippedModules = manifests.modules.filter(module => skippedTargetIds.has(module.id));
   const excludedModules = manifests.modules.filter(module => excludedIds.has(module.id));
+  if (target === 'mistral-vibe' && selectedModules.length === 0) {
+    throw new Error(
+      'Mistral Vibe currently supports explicit Agent Skill installs only; use --skills <id,...>.'
+    );
+  }
   const scaffoldPlan = target
     ? planInstallTargetScaffold({
       target,
       repoRoot: targetPlanningInput.repoRoot,
       projectRoot: targetPlanningInput.projectRoot,
       homeDir: targetPlanningInput.homeDir,
+      env: targetPlanningInput.env,
+      trust: targetPlanningInput.trust,
+      consent: targetPlanningInput.consent,
+      sourceSha: targetPlanningInput.sourceSha,
       modules: selectedModules,
       exemptValidationCodes: options.exemptValidationCodes || [],
     })
@@ -705,7 +837,9 @@ function resolveInstallPlan(options = {}) {
     skippedModules,
     excludedModules,
     targetAdapterId: scaffoldPlan ? scaffoldPlan.adapter.id : null,
+    homeDir: targetPlanningInput ? targetPlanningInput.homeDir : null,
     targetRoot: scaffoldPlan ? scaffoldPlan.targetRoot : null,
+    trustedRoots: scaffoldPlan ? scaffoldPlan.trustedRoots : (scaffoldPlan?.targetRoot ? [scaffoldPlan.targetRoot] : []),
     installStatePath: scaffoldPlan ? scaffoldPlan.installStatePath : null,
     operations: scaffoldPlan ? scaffoldPlan.operations : [],
   };

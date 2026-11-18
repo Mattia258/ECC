@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ECC Dashboard - Everything Claude Code GUI
+ECC Dashboard GUI
 Cross-platform TkInter application for managing ECC components
 """
 
@@ -291,7 +291,7 @@ class ECCDashboard(tk.Tk):
         super().__init__()
         
         self.project_path = get_project_path()
-        self.title("ECC Dashboard - Everything Claude Code")
+        self.title("ECC Dashboard")
         
         maximize_window(self)
         
@@ -656,10 +656,17 @@ Usage: This skill is automatically activated when working with related technolog
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         # Populate
-        for i, cmd in enumerate(self.commands, 1):
-            self.command_tree.insert('', tk.END, text=str(i), 
+        self.populate_commands(self.commands)
+
+    def populate_commands(self, commands: List[Dict]):
+        """Populate commands list"""
+        for item in self.command_tree.get_children():
+            self.command_tree.delete(item)
+
+        for i, cmd in enumerate(commands, 1):
+            self.command_tree.insert('', tk.END, text=str(i),
                                    values=('/' + cmd['name'], cmd['description']))
-    
+
     # =========================================================================
     # RULES TAB
     # =========================================================================
@@ -805,7 +812,7 @@ Usage: This skill is automatically activated when working with related technolog
         about_frame.pack(fill=tk.X, padx=10, pady=10)
         
         about_text = """ECC Dashboard v1.0.0
-Everything Claude Code GUI
+ECC GUI
 
 A cross-platform desktop application for 
 managing and exploring ECC components.
@@ -868,6 +875,8 @@ Project: github.com/affaan-m/ECC"""
         # Repopulate
         self.populate_agents(self.agents)
         self.populate_skills(self.skills)
+        self.populate_commands(self.commands)
+        self.populate_rules(self.rules)
         
         # Update status
         self.status_label.config(

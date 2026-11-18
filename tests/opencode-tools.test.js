@@ -109,6 +109,24 @@ async function main() {
     ])
 
     tests.push([
+      "format-code: normalizes Windows backslash paths to forward slashes",
+      async () => withTempProject(
+        ["tsconfig.json", "src/index.ts"],
+        async (projectDir) => {
+          const context = createMockContext(projectDir)
+          const result = await tools.formatcode.execute(
+            { filePath: "src\\index.ts" },
+            context
+          )
+          const parsed = JSON.parse(result)
+          assert.strictEqual(parsed.success, true)
+          assert.ok(parsed.command.includes("src/index.ts"), `expected forward slashes in command: ${parsed.command}`)
+          assert.ok(!parsed.command.includes("src\\index.ts"), `unexpected backslashes in command: ${parsed.command}`)
+        }
+      ),
+    ])
+
+    tests.push([
       "format-code: detects Python formatter",
       async () => withTempProject(
         ["pyproject.toml", "src/main.py"],
@@ -215,6 +233,134 @@ async function main() {
       ),
     ])
   }
+
+  // Test changed-files tool
+  if (tools.changedfiles) {
+    tests.push([
+      "changed-files: reports an actionable, scrubbed error when plugins/lib is missing",
+      async () => withTempProject([], async (projectDir) => {
+        const repoRoot = path.join(__dirname, "..")
+        const libDir = path.join(repoRoot, ".opencode", "dist", "plugins", "lib")
+        const backupDir = path.join(
+          repoRoot,
+          ".opencode",
+          "dist",
+          "plugins",
+          "lib.missing-store-test-backup"
+        )
+        fs.renameSync(libDir, backupDir)
+        try {
+          const context = createMockContext(projectDir)
+          await assert.rejects(
+            () => tools.changedfiles.execute({}, context),
+            (error) => {
+              assert.ok(error instanceof Error)
+              assert.ok(
+                error.message.includes("ecc repair --target opencode"),
+                "Expected the error to point at the repair command"
+              )
+              assert.ok(
+                !error.message.includes(repoRoot),
+                "Error message must not leak the local filesystem path"
+              )
+              assert.ok(
+                !error.message.includes("Original error"),
+                "Error message must not include the raw underlying loader error"
+              )
+              return true
+            }
+          )
+        } finally {
+          fs.renameSync(backupDir, libDir)
+        }
+      }),
+    ])
+
+    tests.push([
+      "changed-files: renders tracked changes once plugins/lib is present",
+      async () => withTempProject([], async (projectDir) => {
+        const repoRoot = path.join(__dirname, "..")
+        const storeUrl = pathToFileURL(
+          path.join(repoRoot, ".opencode", "dist", "plugins", "lib", "changed-files-store.js")
+        ).href
+        const store = await import(storeUrl)
+        store.initStore(projectDir)
+        store.clearChanges()
+        store.recordChange("src/example.ts", "modified")
+        store.recordChange("src/new-file.ts", "added")
+
+        try {
+          const context = createMockContext(projectDir)
+          const result = await tools.changedfiles.execute({ format: "json" }, context)
+          const parsed = JSON.parse(result)
+          assert.strictEqual(parsed.changed, true)
+          assert.ok(
+            parsed.files.some(
+              (f) =>
+                f.path === path.normalize("src/example.ts") && f.changeType === "modified"
+            )
+          )
+          assert.ok(
+            parsed.files.some(
+              (f) => f.path === path.normalize("src/new-file.ts") && f.changeType === "added"
+            )
+          )
+        } finally {
+          store.clearChanges()
+        }
+      }),
+    ])
+  }
+
+  for (const [lockFile, packageManager, prefix] of [
+    ["package-lock.json", "npm", "npm run test --"],
+    ["pnpm-lock.yaml", "pnpm", "pnpm test"],
+    ["yarn.lock", "yarn", "yarn test"],
+    ["bun.lockb", "bun", "bun test"],
+  ]) {
+    tests.push([
+      `run-tests: ${packageManager} forwards Vitest file filters without Jest options`,
+      async () => withTempProject([lockFile], async (projectDir) => {
+        fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({
+          scripts: { test: "vitest run" }, devDependencies: { vitest: "^3.0.0" },
+        }))
+        const result = JSON.parse(await tools.runtests.execute(
+          { pattern: "src/math.test.ts", coverage: true, updateSnapshots: true },
+          createMockContext(projectDir)
+        ))
+        assert.strictEqual(result.testFramework, "vitest")
+        assert.strictEqual(result.packageManager, packageManager)
+        assert.strictEqual(result.command, `${prefix} --coverage -u src/math.test.ts`)
+      }),
+    ])
+  }
+
+  tests.push([
+    "run-tests: retains Jest filtering and unfiltered Vitest commands",
+    async () => withTempProject(["package-lock.json"], async (projectDir) => {
+      const packagePath = path.join(projectDir, "package.json")
+      fs.writeFileSync(packagePath, JSON.stringify({ devDependencies: { jest: "^29.0.0" } }))
+      const jest = JSON.parse(await tools.runtests.execute(
+        { pattern: "math.test.ts" }, createMockContext(projectDir)
+      ))
+      assert.strictEqual(jest.command, "npm run test -- --testPathPattern math.test.ts")
+      fs.writeFileSync(packagePath, JSON.stringify({ devDependencies: { vitest: "^3.0.0" } }))
+      const vitest = JSON.parse(await tools.runtests.execute({}, createMockContext(projectDir)))
+      assert.strictEqual(vitest.command, "npm run test")
+    }),
+  ])
+
+  tests.push([
+    "run-tests: unknown frameworks keep positional patterns and watch mode",
+    async () => withTempProject([], async (projectDir) => {
+      const result = JSON.parse(await tools.runtests.execute(
+        { pattern: "spec/example.test.js", watch: true }, createMockContext(projectDir)
+      ))
+      assert.strictEqual(result.packageManager, "npm")
+      assert.strictEqual(result.testFramework, "unknown")
+      assert.strictEqual(result.command, "npm run test -- --watch spec/example.test.js")
+    }),
+  ])
 
   // Run all tests
   let passed = 0

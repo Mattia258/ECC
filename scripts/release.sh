@@ -14,8 +14,11 @@ AGENT_YAML="agent.yaml"
 VERSION_FILE="VERSION"
 PLUGIN_JSON=".claude-plugin/plugin.json"
 MARKETPLACE_JSON=".claude-plugin/marketplace.json"
+GROK_PLUGIN_JSON=".grok-plugin/plugin.json"
+GROK_MARKETPLACE_JSON=".grok-plugin/marketplace.json"
 CODEX_MARKETPLACE_JSON=".agents/plugins/marketplace.json"
 CODEX_PLUGIN_JSON=".codex-plugin/plugin.json"
+QODER_PLUGIN_JSON=".qoder-plugin/plugin.json"
 CODEX_MARKETPLACE_PLUGIN_JSON="plugins/ecc/.codex-plugin/plugin.json"
 OPENCODE_PACKAGE_JSON=".opencode/package.json"
 OPENCODE_PACKAGE_LOCK_JSON=".opencode/package-lock.json"
@@ -60,7 +63,7 @@ if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
 fi
 
 # Verify versioned manifests exist
-for FILE in "$ROOT_PACKAGE_JSON" "$PACKAGE_LOCK_JSON" "$ROOT_AGENTS_MD" "$TR_AGENTS_MD" "$ZH_CN_AGENTS_MD" "$AGENT_YAML" "$VERSION_FILE" "$PLUGIN_JSON" "$MARKETPLACE_JSON" "$CODEX_MARKETPLACE_JSON" "$CODEX_PLUGIN_JSON" "$OPENCODE_PACKAGE_JSON" "$OPENCODE_PACKAGE_LOCK_JSON" "$OPENCODE_ECC_HOOKS_PLUGIN" "$README_FILE" "$ROOT_ZH_CN_README_FILE" "$TR_README_FILE" "$PT_BR_README_FILE" "$ZH_CN_README_FILE" "$SELECTIVE_INSTALL_ARCHITECTURE_DOC"; do
+for FILE in "$ROOT_PACKAGE_JSON" "$PACKAGE_LOCK_JSON" "$ROOT_AGENTS_MD" "$TR_AGENTS_MD" "$ZH_CN_AGENTS_MD" "$AGENT_YAML" "$VERSION_FILE" "$PLUGIN_JSON" "$MARKETPLACE_JSON" "$GROK_PLUGIN_JSON" "$GROK_MARKETPLACE_JSON" "$CODEX_MARKETPLACE_JSON" "$CODEX_PLUGIN_JSON" "$QODER_PLUGIN_JSON" "$OPENCODE_PACKAGE_JSON" "$OPENCODE_PACKAGE_LOCK_JSON" "$OPENCODE_ECC_HOOKS_PLUGIN" "$README_FILE" "$ROOT_ZH_CN_README_FILE" "$TR_README_FILE" "$PT_BR_README_FILE" "$ZH_CN_README_FILE" "$SELECTIVE_INSTALL_ARCHITECTURE_DOC"; do
   if [[ ! -f "$FILE" ]]; then
     echo "Error: $FILE not found"
     exit 1
@@ -73,6 +76,15 @@ if [[ -z "$OLD_VERSION" ]]; then
   echo "Error: Could not extract current version from $PLUGIN_JSON"
   exit 1
 fi
+
+if [[ "$OLD_VERSION" == "$VERSION" ]]; then
+  echo "Error: Version $VERSION is already declared in release metadata."
+  echo "After the merged commit passes CI, publish it through the tag workflow:"
+  echo "  git tag -s \"v$VERSION\" -m \"Release v$VERSION\""
+  echo "  git push origin \"v$VERSION\""
+  exit 1
+fi
+
 echo "Bumping version: $OLD_VERSION -> $VERSION"
 
 update_version() {
@@ -140,23 +152,49 @@ update_readme_version_row() {
   ' "$file" "$VERSION" "$label" "$first_col" "$second_col" "$third_col"
 }
 
-update_latest_release_heading() {
+update_marketplace_plugin_version() {
   local file="$1"
+  # Was `sed "0,/re/s|..."`, which is a GNU extension. BSD sed on macOS ignores
+  # it and still exits 0, so the bump silently no-opped here and only surfaced
+  # later as a plugin-manifest test failure. Node replaces the first match on
+  # every platform and fails loudly.
   node -e '
     const fs = require("fs");
     const file = process.argv[1];
     const version = process.argv[2];
     const current = fs.readFileSync(file, "utf8");
     const updated = current.replace(
-      /^### v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?( .*)$/m,
-      `### v${version}$1`
+      /"version": *"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?"/,
+      `"version": "${version}"`
     );
     if (updated === current) {
-      console.error(`Error: could not update latest release heading in ${file}`);
+      console.error(`Error: could not update plugin version in ${file}`);
       process.exit(1);
     }
     fs.writeFileSync(file, updated);
   ' "$file" "$VERSION"
+}
+
+update_latest_release_heading() {
+  local file="$1"
+  local old_version="$2"
+  node -e '
+    const fs = require("fs");
+    const file = process.argv[1];
+    const version = process.argv[2];
+    const oldVersion = process.argv[3];
+    const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const current = fs.readFileSync(file, "utf8");
+    const updated = current.replace(
+      new RegExp(`^### v${escape(oldVersion)}( .*)$`, "m"),
+      `### v${version}$1`
+    );
+    if (updated === current) {
+      console.error(`Error: could not update release heading for v${oldVersion} in ${file}`);
+      process.exit(1);
+    }
+    fs.writeFileSync(file, updated);
+  ' "$file" "$VERSION" "$old_version"
 }
 
 update_selective_install_repo_version() {
@@ -248,7 +286,7 @@ update_opencode_hook_banner_version() {
     const version = process.argv[2];
     const current = fs.readFileSync(file, "utf8");
     const updated = current.replace(
-      /(## Active Plugin: Everything Claude Code v)[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?/,
+      /(## Active Plugin: (?:Everything Claude Code|ECC) v)[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?/,
       `$1${version}`
     );
     if (updated === current) {
@@ -268,19 +306,25 @@ update_agents_version "$ZH_CN_AGENTS_MD" "版本"
 update_agent_yaml_version
 update_version_file
 update_version "$PLUGIN_JSON" "s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSION\"|"
-update_version "$MARKETPLACE_JSON" "0,/\"version\": *\"[^\"]*\"/s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSION\"|"
+update_marketplace_plugin_version "$MARKETPLACE_JSON"
+update_version "$GROK_PLUGIN_JSON" "s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSION\"|"
+update_marketplace_plugin_version "$GROK_MARKETPLACE_JSON"
 update_codex_marketplace_version
 update_version "$CODEX_PLUGIN_JSON" "s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSION\"|"
+update_version "$QODER_PLUGIN_JSON" "s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSION\"|"
 update_version "$CODEX_MARKETPLACE_PLUGIN_JSON" "s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSION\"|"
 update_version "$OPENCODE_PACKAGE_JSON" "s|\"version\": *\"[^\"]*\"|\"version\": \"$VERSION\"|"
 update_package_lock_version "$OPENCODE_PACKAGE_LOCK_JSON"
 update_opencode_hook_banner_version
 update_readme_version_row "$README_FILE" "Version" "Plugin" "Plugin" "Reference config"
 update_readme_version_row "$ZH_CN_README_FILE" "版本" "插件" "插件" "参考配置"
-update_latest_release_heading "$README_FILE"
-update_latest_release_heading "$ROOT_ZH_CN_README_FILE"
-update_latest_release_heading "$TR_README_FILE"
-update_latest_release_heading "$PT_BR_README_FILE"
+update_latest_release_heading "$README_FILE" "$OLD_VERSION"
+update_latest_release_heading "$ROOT_ZH_CN_README_FILE" "$OLD_VERSION"
+update_latest_release_heading "$TR_README_FILE" "$OLD_VERSION"
+update_latest_release_heading "$PT_BR_README_FILE" "$OLD_VERSION"
+# docs/zh-CN/README.md got its version row bumped but never its release
+# heading, so plugin-manifest.test.js failed on it every time.
+update_latest_release_heading "$ZH_CN_README_FILE" "$OLD_VERSION"
 update_selective_install_repo_version "$SELECTIVE_INSTALL_ARCHITECTURE_DOC"
 
 # Verify the bumped release surface is still internally consistent before
@@ -291,9 +335,30 @@ node tests/scripts/build-opencode.test.js
 node tests/plugin-manifest.test.js
 
 # Stage, commit, tag, and push
-git add "$ROOT_PACKAGE_JSON" "$PACKAGE_LOCK_JSON" "$ROOT_AGENTS_MD" "$TR_AGENTS_MD" "$ZH_CN_AGENTS_MD" "$AGENT_YAML" "$VERSION_FILE" "$PLUGIN_JSON" "$MARKETPLACE_JSON" "$CODEX_MARKETPLACE_JSON" "$CODEX_PLUGIN_JSON" "$OPENCODE_PACKAGE_JSON" "$OPENCODE_PACKAGE_LOCK_JSON" "$OPENCODE_ECC_HOOKS_PLUGIN" "$README_FILE" "$ROOT_ZH_CN_README_FILE" "$TR_README_FILE" "$PT_BR_README_FILE" "$ZH_CN_README_FILE" "$SELECTIVE_INSTALL_ARCHITECTURE_DOC"
+git add "$ROOT_PACKAGE_JSON" "$PACKAGE_LOCK_JSON" "$ROOT_AGENTS_MD" "$TR_AGENTS_MD" "$ZH_CN_AGENTS_MD" "$AGENT_YAML" "$VERSION_FILE" "$PLUGIN_JSON" "$MARKETPLACE_JSON" "$GROK_PLUGIN_JSON" "$GROK_MARKETPLACE_JSON" "$CODEX_MARKETPLACE_JSON" "$CODEX_PLUGIN_JSON" "$QODER_PLUGIN_JSON" "$CODEX_MARKETPLACE_PLUGIN_JSON" "$OPENCODE_PACKAGE_JSON" "$OPENCODE_PACKAGE_LOCK_JSON" "$OPENCODE_ECC_HOOKS_PLUGIN" "$README_FILE" "$ROOT_ZH_CN_README_FILE" "$TR_README_FILE" "$PT_BR_README_FILE" "$ZH_CN_README_FILE" "$SELECTIVE_INSTALL_ARCHITECTURE_DOC"
 git commit -m "chore: bump plugin version to $VERSION"
-git tag "v$VERSION"
+
+# The source commit cannot contain its own SHA. Commit the release first,
+# then update the catalog and tag the pin-only commit.
+GROK_SOURCE_SHA=$(git rev-parse HEAD)
+node -e '
+  const fs = require("fs");
+  const file = process.argv[1];
+  const sha = process.argv[2];
+  const marketplace = JSON.parse(fs.readFileSync(file, "utf8"));
+  const plugin = marketplace.plugins && marketplace.plugins.find(entry => entry && entry.name === "ecc");
+  if (!plugin || !plugin.source || typeof plugin.source !== "object") {
+    console.error(`Error: could not find ecc Grok source in ${file}`);
+    process.exit(1);
+  }
+  plugin.source.sha = sha;
+  fs.writeFileSync(file, `${JSON.stringify(marketplace, null, 2)}\n`);
+' "$GROK_MARKETPLACE_JSON" "$GROK_SOURCE_SHA"
+node scripts/ci/validate-grok-pin.js --release
+git add "$GROK_MARKETPLACE_JSON"
+git commit -m "chore: pin Grok marketplace to release source"
+node scripts/ci/validate-grok-pin.js --release
+git tag -s "v$VERSION" -m "Release v$VERSION"
 git push origin main "v$VERSION"
 
 echo "Released v$VERSION"

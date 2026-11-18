@@ -17,53 +17,47 @@
  * keeping the PreToolUse hook fast even for very large sessions.
  */
 
-const fs = require('fs');
+const { readFileTail, DEFAULT_TRANSCRIPT_TAIL_BYTES } = require('./file-tail');
 
 const STANDARD_CONTEXT_WINDOW_TOKENS = 200000;
 const LARGE_CONTEXT_WINDOW_TOKENS = 1000000;
 const DEFAULT_CONTEXT_THRESHOLD_STANDARD = 160000;
 const DEFAULT_CONTEXT_THRESHOLD_LARGE = 250000;
 const DEFAULT_CONTEXT_INTERVAL_TOKENS = 60000;
-const DEFAULT_TRANSCRIPT_TAIL_BYTES = 256 * 1024;
 const MAX_TOKEN_SETTING = 10000000;
 const LARGE_WINDOW_MODEL_MARKER = '[1m]';
+
+// Known large-window model families whose ids carry no `[1m]` marker (#2461).
+// Matched boundary-aware against the model id — covers dated/region-prefixed
+// variants (e.g. `us.anthropic.claude-fable-5-20260115-v1:0`) without matching
+// hypothetical smaller tiers sharing the prefix (e.g. `claude-fable-5-mini`).
+// Checked in order, first match wins. Best-effort and expected to lag new
+// releases; the env override remains the escape hatch for unlisted models.
+const KNOWN_MODEL_WINDOW_TOKENS = [
+  ['claude-opus-5', LARGE_CONTEXT_WINDOW_TOKENS],
+  ['claude-fable-5', LARGE_CONTEXT_WINDOW_TOKENS],
+  ['claude-mythos-5', LARGE_CONTEXT_WINDOW_TOKENS]
+];
+
+/**
+ * True when `model` contains `familyId` ending at a token boundary: end of id,
+ * a delimiter (`[`, `:`, `.`), or a dated/versioned suffix (`-20260115`).
+ * Alphanumeric continuations and letter suffixes (`-mini`) are different
+ * models, possibly with smaller windows, and must not match.
+ */
+function isKnownModelFamilyMatch(model, familyId) {
+  const start = model.indexOf(familyId);
+  if (start === -1) {
+    return false;
+  }
+  const rest = model.slice(start + familyId.length);
+  return !/^[A-Za-z0-9]/.test(rest) && !/^-[A-Za-z]/.test(rest);
+}
 
 /**
  * Read the trailing `tailBytes` of a file as UTF-8.
  * Returns null when the file is missing or unreadable.
  */
-function readFileTail(filePath, tailBytes) {
-  let fd;
-  try {
-    fd = fs.openSync(filePath, 'r');
-  } catch {
-    return null;
-  }
-
-  try {
-    const size = fs.fstatSync(fd).size;
-    const start = Math.max(0, size - tailBytes);
-    const length = size - start;
-    if (length <= 0) {
-      return { text: '', truncated: false };
-    }
-
-    const buffer = Buffer.alloc(length);
-    const bytesRead = fs.readSync(fd, buffer, 0, length, start);
-    return {
-      text: buffer.toString('utf8', 0, bytesRead),
-      truncated: start > 0
-    };
-  } catch {
-    return null;
-  } finally {
-    try {
-      fs.closeSync(fd);
-    } catch {
-      /* ignore */
-    }
-  }
-}
 
 /**
  * Extract the context token total from a transcript record's usage block.
@@ -100,14 +94,16 @@ function readLatestContextTokens(transcriptPath, options = {}) {
 
   const tailBytes = Number.isInteger(options.tailBytes) && options.tailBytes > 0 ? options.tailBytes : DEFAULT_TRANSCRIPT_TAIL_BYTES;
 
-  const tail = readFileTail(transcriptPath, tailBytes);
+  // Include the preceding byte so a newline at the requested boundary keeps
+  // the first complete record; a mid-record boundary still gets discarded.
+  const tail = readFileTail(transcriptPath, tailBytes + 1, { includeByteLength: true });
   if (!tail) {
     return null;
   }
 
   const lines = tail.text.split('\n');
-  // The first line of a truncated tail is almost certainly partial JSON.
-  const firstLine = tail.truncated ? 1 : 0;
+  // Discard the extra boundary byte and any partial record containing it.
+  const firstLine = tail.truncated || tail.byteLength > tailBytes ? 1 : 0;
 
   for (let i = lines.length - 1; i >= firstLine; i--) {
     const line = lines[i].trim();
@@ -131,36 +127,90 @@ function readLatestContextTokens(transcriptPath, options = {}) {
 }
 
 /**
- * Detect the context window size for a turn.
- * 1M when the model id carries the `[1m]` marker, or when the observed token
- * count already exceeds the standard 200k window (covers logs that drop the
- * suffix); otherwise the standard 200k window.
+ * Detect the context window size for a turn, and report whether that size was
+ * positively detected or merely assumed.
+ *
+ * `inferred: false` means the size came from evidence — an explicit env
+ * override, the `[1m]` marker, or a known large-window family. An observed
+ * token count above the standard window selects the safer large-window
+ * thresholds, but remains inferred because the true denominator could be an
+ * unmarked intermediate size such as 400k. Callers must not present inferred
+ * windows as fact.
+ *
+ * @param {number} tokens
+ * @param {string} [model]
+ * @param {object} [env] - Environment to read overrides from; defaults to
+ *   process.env. Callers supporting injected environments (hook run()
+ *   options.env) must pass theirs through so window overrides are honored
+ *   consistently with the threshold controls.
+ * @returns {{ windowTokens: number, inferred: boolean }}
  */
-function resolveContextWindowTokens(tokens, model) {
+function resolveContextWindow(tokens, model, env) {
   // Explicit window override wins: 400k models (e.g. Opus 4.x) match neither the
   // 200k default nor the 1M marker and would otherwise report ~double usage (#2290).
-  // Honor ECC's own knob and Claude Code's native CLAUDE_CODE_AUTO_COMPACT_WINDOW.
-  const env = (typeof process !== 'undefined' && process.env) || {};
-  const envWindow = Number.parseInt(env.ECC_CONTEXT_WINDOW_TOKENS || env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '', 10);
-  if (Number.isInteger(envWindow) && envWindow > 0) {
-    return envWindow;
+  // ECC's explicit window size takes precedence over model evidence.
+  const environment = env || (typeof process !== 'undefined' && process.env) || {};
+  const explicitWindow = Number(environment.ECC_CONTEXT_WINDOW_TOKENS || '');
+  if (Number.isSafeInteger(explicitWindow) && explicitWindow > 0) {
+    return { windowTokens: explicitWindow, inferred: false };
   }
 
   if (typeof model === 'string' && model.includes(LARGE_WINDOW_MODEL_MARKER)) {
-    return LARGE_CONTEXT_WINDOW_TOKENS;
+    return { windowTokens: LARGE_CONTEXT_WINDOW_TOKENS, inferred: false };
+  }
+
+  // Large-window model families without a [1m] marker fall through the checks
+  // above and would be misreported against the 200k default (#2461).
+  if (typeof model === 'string') {
+    const known = KNOWN_MODEL_WINDOW_TOKENS.find(([familyId]) => isKnownModelFamilyMatch(model, familyId));
+    if (known) {
+      return { windowTokens: known[1], inferred: false };
+    }
   }
 
   if (Number.isFinite(tokens) && tokens > STANDARD_CONTEXT_WINDOW_TOKENS) {
-    return LARGE_CONTEXT_WINDOW_TOKENS;
+    return { windowTokens: LARGE_CONTEXT_WINDOW_TOKENS, inferred: true };
   }
 
-  return STANDARD_CONTEXT_WINDOW_TOKENS;
+  // Claude Code's CLAUDE_CODE_AUTO_COMPACT_WINDOW is the harness auto-compact
+  // trigger point (e.g. 786432 on a 1M-window model), not the context window
+  // size. Honor it only as a last-resort fallback so it cannot mask the [1m]
+  // marker, known large-window families, or >200k observed tokens above.
+  const autoCompactWindow = Number(environment.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '');
+  if (Number.isSafeInteger(autoCompactWindow) && autoCompactWindow > 0) {
+    return { windowTokens: autoCompactWindow, inferred: false };
+  }
+
+  return { windowTokens: STANDARD_CONTEXT_WINDOW_TOKENS, inferred: true };
+}
+
+/**
+ * Detect the context window size for a turn.
+ * 1M when the model id carries the `[1m]` marker, matches a known large-window
+ * model family, or when the observed token count already exceeds the standard
+ * 200k window (covers logs that drop the suffix); otherwise the standard 200k
+ * window.
+ */
+function resolveContextWindowTokens(tokens, model) {
+  return resolveContextWindow(tokens, model).windowTokens;
+}
+
+/**
+ * True when the resolved window is the assumed 200k default rather than a
+ * detected size. Opt-in large-window models that ship no `[1m]` marker in the
+ * transcript (e.g. a 1M-context Opus tier, where the base tier is 200k and the
+ * two are indistinguishable by model id) land here, so a percentage computed
+ * against 200k can be wildly wrong while usage sits below that mark.
+ */
+function isContextWindowInferred(tokens, model) {
+  return resolveContextWindow(tokens, model).inferred;
 }
 
 /**
  * Resolve the context-size suggestion threshold (tokens).
  * `COMPACT_CONTEXT_THRESHOLD=0` disables the context signal entirely;
- * other invalid values fall back to the window-scaled default.
+ * other invalid values fall back to the window-scaled default, capped at
+ * 80 percent of a valid native compaction budget when that is earlier.
  */
 function resolveContextThreshold(env, windowTokens) {
   const raw = env && env.COMPACT_CONTEXT_THRESHOLD;
@@ -174,7 +224,13 @@ function resolveContextThreshold(env, windowTokens) {
     }
   }
 
-  return windowTokens >= LARGE_CONTEXT_WINDOW_TOKENS ? DEFAULT_CONTEXT_THRESHOLD_LARGE : DEFAULT_CONTEXT_THRESHOLD_STANDARD;
+  const defaultThreshold = windowTokens >= LARGE_CONTEXT_WINDOW_TOKENS ? DEFAULT_CONTEXT_THRESHOLD_LARGE : DEFAULT_CONTEXT_THRESHOLD_STANDARD;
+  const nativeBudget = Number(env && env.CLAUDE_CODE_AUTO_COMPACT_WINDOW);
+  if (!Number.isSafeInteger(nativeBudget) || nativeBudget <= 0) return defaultThreshold;
+  // Keep the standard 160k/200k headroom before native compaction, without
+  // changing model-capacity evidence or an explicit reminder policy above.
+  const nativeThreshold = Math.max(1, Math.floor(nativeBudget * (DEFAULT_CONTEXT_THRESHOLD_STANDARD / STANDARD_CONTEXT_WINDOW_TOKENS)));
+  return Math.min(defaultThreshold, nativeThreshold);
 }
 
 /**
@@ -216,8 +272,11 @@ module.exports = {
   DEFAULT_CONTEXT_THRESHOLD_LARGE,
   DEFAULT_CONTEXT_INTERVAL_TOKENS,
   DEFAULT_TRANSCRIPT_TAIL_BYTES,
+  readFileTail,
   readLatestContextTokens,
+  resolveContextWindow,
   resolveContextWindowTokens,
+  isContextWindowInferred,
   resolveContextThreshold,
   resolveContextInterval,
   computeContextBucket,

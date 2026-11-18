@@ -7,12 +7,141 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const http = require('http');
+const net = require('net');
+const vm = require('vm');
 
 const SCRIPT = path.join(__dirname, '..', '..', 'scripts', 'dashboard-web.js');
 
 let testRoot;
 let testPassed = 0;
 let testFailed = 0;
+const asyncTests = [];
+const REQUEST_TIMEOUT_MS = 5000;
+
+for (const override of ['ECC_AGENT_DATA_HOME', 'CLAUDE_CONFIG_DIR']) {
+  asyncTest(`activity HTTP feed reads real hook output with ${override}`, async () => {
+    const { spawnSync } = require('child_process');
+    const dir = createTempDir('ecc-activity-override-');
+    const saved = Object.fromEntries(['ECC_AGENT_DATA_HOME', 'CLAUDE_CONFIG_DIR', 'CURSOR_VERSION', 'CURSOR_PROJECT_DIR'].map(key => [key, process.env[key]]));
+    try {
+      for (const key of Object.keys(saved)) delete process.env[key];
+      process.env[override] = dir;
+      const payload = { session_id: `override-${override}`, tool_name: 'Read', tool_input: { file_path: 'fixture.txt' } };
+      const result = spawnSync(process.execPath, [path.resolve(__dirname, '../../scripts/hooks/session-activity-tracker.js')], {
+        input: JSON.stringify(payload), encoding: 'utf8', timeout: 10000, env: process.env,
+      });
+      assert.strictEqual(result.status, 0, result.stderr);
+      assert.ok(fs.existsSync(path.join(dir, 'metrics', 'tool-usage.jsonl')));
+      await withDashboardServer(async port => {
+        const response = await requestDashboard(port, { path: '/api/activity' });
+        assert.strictEqual(response.statusCode, 200);
+        const { entries } = JSON.parse(response.body);
+        assert.strictEqual(entries.length, 1);
+        assert.strictEqual(entries[0].session_id, payload.session_id);
+        assert.strictEqual(entries[0].tool_name, 'Read');
+      });
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      cleanup(dir);
+    }
+  });
+}
+
+test('renderHTML emits executable scripts without syntax errors', () => {
+  const { renderHTML } = require(SCRIPT);
+  const html = renderHTML({ agents: [], skills: [], commands: [], rules: [], mcps: [], hooks: [] });
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+  assert.ok(scripts.length > 0);
+  for (const script of scripts) new vm.Script(script[1]);
+});
+
+asyncTest('served activity UI shows HTTP failures as errors and preserves healthy empty and populated feeds', async () => {
+  const dir = createTempDir('ecc-activity-response-');
+  const savedDataHome = process.env.ECC_AGENT_DATA_HOME;
+  const originalClose = fs.closeSync;
+  try {
+    process.env.ECC_AGENT_DATA_HOME = dir;
+    const log = path.join(dir, 'metrics', 'tool-usage.jsonl');
+    writeFile(dir, 'metrics/tool-usage.jsonl', '');
+    const reported = [];
+    await withDashboardServer(async port => {
+      const page = await requestDashboard(port);
+      assert.strictEqual(page.statusCode, 200);
+      const script = [...page.body.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+        .find(match => match[1].includes('function renderActivity()'))[1];
+      async function renderFeed() {
+        let status;
+        let jsonReads = 0;
+        const html = await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => reject(new Error('Activity UI did not render')), REQUEST_TIMEOUT_MS);
+          const panel = { set innerHTML(value) { clearTimeout(timeout); resolve(value); } };
+          const context = vm.createContext({
+            document: { getElementById: () => panel, createElement: () => ({}), head: { appendChild() {} } },
+            window: { showTab() {} }, setInterval() {}, clearInterval() {},
+            fetch: async url => {
+              const response = await fetch(`http://127.0.0.1:${port}${url}`);
+              status = response.status;
+              return { ok: response.ok, json() { jsonReads++; return response.json(); } };
+            },
+          });
+          new vm.Script(script).runInContext(context);
+          context.window.showTab('activity');
+        });
+        return { html, status, jsonReads };
+      }
+      // A descriptor-close failure escapes loadActivity's read catch and drives
+      // the real server's generic HTTP 500 response without leaking its detail.
+      fs.closeSync = fd => { originalClose(fd); throw new Error('private close detail'); };
+      const failed = await renderFeed();
+      fs.closeSync = originalClose;
+      assert.strictEqual(failed.status, 500);
+      assert.match(failed.html, /Could not load activity feed/);
+      assert.doesNotMatch(failed.html, /No recorded tool calls|private close detail/);
+      assert.strictEqual(failed.jsonReads, 0);
+      assert.strictEqual(reported.length, 1);
+      const empty = await renderFeed();
+      assert.strictEqual(empty.status, 200);
+      assert.match(empty.html, /No recorded tool calls yet/);
+      assert.strictEqual(empty.jsonReads, 1);
+      fs.writeFileSync(log, JSON.stringify({ session_id: 'response-fixture', tool_name: 'Read', input_summary: 'visible activity' }) + '\n');
+      const populated = await renderFeed();
+      assert.strictEqual(populated.status, 200);
+      assert.match(populated.html, /visible activity/);
+      assert.doesNotMatch(populated.html, /Could not load activity feed|No recorded tool calls/);
+    }, { reportError: (message, error) => reported.push({ message, error }) });
+  } finally {
+    fs.closeSync = originalClose;
+    if (savedDataHome === undefined) delete process.env.ECC_AGENT_DATA_HOME;
+    else process.env.ECC_AGENT_DATA_HOME = savedDataHome;
+    cleanup(dir);
+  }
+});
+
+test('activity loading bounds large logs and ignores malformed rows', () => {
+  const { loadActivity } = require(SCRIPT);
+  withTempDir('ecc-activity-', dir => {
+    const log = path.join(dir, 'usage.jsonl');
+    const row = name => JSON.stringify({ session_id: 'fixture', tool_name: name });
+    fs.writeFileSync(log, 'x'.repeat(1024 * 1024) + '\n' + row('Read') + '\nnull\n{"session_id":42,"tool_name":"Read"}\nnot-json\n' + row('Skill') + '\n');
+    const originalRead = fs.readSync;
+    let bytesRequested = 0;
+    fs.readSync = (...args) => {
+      bytesRequested += args[3];
+      return originalRead(...args);
+    };
+    let rows;
+    try { rows = loadActivity(200, log); }
+    finally { fs.readSync = originalRead; }
+    assert.ok(bytesRequested <= 256 * 1024);
+    assert.deepStrictEqual(rows.map(entry => entry.tool_name), ['Skill', 'Read']);
+    fs.writeFileSync(log, row('Edit') + '\n');
+    assert.deepStrictEqual(loadActivity(200, log).map(entry => entry.tool_name), ['Edit']);
+    assert.deepStrictEqual(loadActivity(200, path.join(dir, 'missing')), []);
+  });
+});
 
 function test(name, fn) {
   try {
@@ -28,6 +157,10 @@ function test(name, fn) {
   }
 }
 
+function asyncTest(name, fn) {
+  asyncTests.push({ name, fn });
+}
+
 function createTempDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -36,10 +169,148 @@ function cleanup(dirPath) {
   fs.rmSync(dirPath, { recursive: true, force: true });
 }
 
+function withTempDir(prefix, fn) {
+  const dirPath = createTempDir(prefix);
+  try {
+    return fn(dirPath);
+  } finally {
+    cleanup(dirPath);
+  }
+}
+
+test('withTempDir removes temp directories when the callback throws', () => {
+  let createdDir = '';
+  assert.throws(() => {
+    withTempDir('ecc-test-', dirPath => {
+      createdDir = dirPath;
+      assert.ok(fs.existsSync(createdDir));
+      throw new Error('fixture failure');
+    });
+  }, /fixture failure/);
+
+  assert.ok(createdDir);
+  assert.ok(!fs.existsSync(createdDir));
+});
+
 function writeFile(rootDir, relativePath, content) {
   const targetPath = path.join(rootDir, relativePath);
   fs.mkdirSync(path.dirname(targetPath), { recursive: true });
   fs.writeFileSync(targetPath, content);
+}
+
+function requestDashboard(port, options = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let request;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      callback(value);
+    };
+    const timeout = setTimeout(() => {
+      const error = new Error(
+        `Dashboard request timed out after ${REQUEST_TIMEOUT_MS}ms`
+      );
+      if (request) request.destroy();
+      settle(reject, error);
+    }, REQUEST_TIMEOUT_MS);
+
+    request = http.request({
+      host: '127.0.0.1',
+      port,
+      method: options.method || 'GET',
+      path: options.path || '/',
+      headers: options.headers || {},
+      setHost: options.setHost !== false,
+    }, (response) => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => {
+        body += chunk;
+      });
+      response.on('error', error => settle(reject, error));
+      response.on('end', () => {
+        settle(resolve, {
+          body,
+          headers: response.headers,
+          statusCode: response.statusCode,
+        });
+      });
+    });
+    request.on('error', error => settle(reject, error));
+    request.end();
+  });
+}
+
+function requestDashboardWithoutHost(port) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: '127.0.0.1', port });
+    let raw = '';
+    let settled = false;
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      callback(value);
+    };
+    const timeout = setTimeout(() => {
+      const error = new Error(
+        `Host-less request timed out after ${REQUEST_TIMEOUT_MS}ms`
+      );
+      socket.destroy();
+      settle(reject, error);
+    }, REQUEST_TIMEOUT_MS);
+
+    socket.setEncoding('utf8');
+    socket.on('connect', () => {
+      socket.write('GET / HTTP/1.0\r\n\r\n');
+    });
+    socket.on('data', (chunk) => {
+      raw += chunk;
+    });
+    socket.on('end', () => {
+      const [head, body = ''] = raw.split('\r\n\r\n');
+      const lines = head.split('\r\n');
+      const statusCode = Number.parseInt(lines[0].split(' ')[1], 10);
+      const headers = {};
+      for (const line of lines.slice(1)) {
+        const separator = line.indexOf(':');
+        if (separator < 1) continue;
+        headers[line.slice(0, separator).toLowerCase()] = line.slice(separator + 1).trim();
+      }
+      settle(resolve, { body, headers, statusCode });
+    });
+    socket.on('error', error => settle(reject, error));
+    socket.on('close', hadError => {
+      if (!hadError && !settled) {
+        settle(reject, new Error('Host-less request closed before completion'));
+      }
+    });
+  });
+}
+
+async function withDashboardServer(fn, serverOptions = {}) {
+  const { createDashboardServer } = require(SCRIPT);
+  const testServer = createDashboardServer({
+    host: '127.0.0.1',
+    ...serverOptions,
+  });
+  await new Promise((resolve, reject) => {
+    testServer.once('error', reject);
+    testServer.listen(0, '127.0.0.1', () => {
+      testServer.off('error', reject);
+      resolve();
+    });
+  });
+
+  try {
+    await fn(testServer.address().port);
+  } finally {
+    await new Promise((resolve, reject) => {
+      testServer.close(error => (error ? reject(error) : resolve()));
+    });
+  }
 }
 
 // ===================== parsePort =====================
@@ -125,6 +396,43 @@ test('readFrontmatter parses array tools field', () => {
   cleanup(testRoot);
 });
 
+test('readFrontmatter preserves scoped tools in legacy flow sequences', () => {
+  const { readFrontmatter } = require(SCRIPT);
+  withTempDir('ecc-test-', tempDir => {
+    writeFile(tempDir, 'agent.md', [
+      '---',
+      'name: scoped-agent',
+      'tools: [Agent(worker, researcher), Read, Bash(git commit:*, git status:*)]',
+      '---',
+      'body',
+    ].join('\n'));
+
+    const fm = readFrontmatter(path.join(tempDir, 'agent.md'));
+    assert.deepStrictEqual(fm.tools, [
+      'Agent(worker, researcher)',
+      'Read',
+      'Bash(git commit:*, git status:*)',
+    ]);
+  });
+});
+
+test('readFrontmatter normalizes comma-separated scalar tools to an array', () => {
+  const { readFrontmatter } = require(SCRIPT);
+  testRoot = createTempDir('ecc-test-');
+  writeFile(testRoot, 'agent.md', [
+    '---',
+    'name: test-agent',
+    'tools: Bash, Read, Write',
+    '---',
+    '# Body',
+  ].join('\n'));
+
+  const fm = readFrontmatter(path.join(testRoot, 'agent.md'));
+  assert.ok(Array.isArray(fm.tools));
+  assert.deepStrictEqual(fm.tools, ['Bash', 'Read', 'Write']);
+  cleanup(testRoot);
+});
+
 test('readFrontmatter handles quoted values', () => {
   const { readFrontmatter } = require(SCRIPT);
   testRoot = createTempDir('ecc-test-');
@@ -179,6 +487,28 @@ test('readSkill parses skill frontmatter and body', () => {
   cleanup(testRoot);
 });
 
+test('readSkill reads each skill file only once', () => {
+  const { readSkill } = require(SCRIPT);
+  testRoot = createTempDir('ecc-test-');
+  const skillPath = path.join(testRoot, 'SKILL.md');
+  writeFile(testRoot, 'SKILL.md', '---\ndescription: A test skill\n---\nbody');
+  const originalReadFileSync = fs.readFileSync;
+  let readCount = 0;
+  fs.readFileSync = (...args) => {
+    readCount++;
+    return originalReadFileSync(...args);
+  };
+
+  try {
+    readSkill(skillPath);
+  } finally {
+    fs.readFileSync = originalReadFileSync;
+    cleanup(testRoot);
+  }
+
+  assert.strictEqual(readCount, 1);
+});
+
 test('readSkill returns empty defaults for missing file', () => {
   const { readSkill } = require(SCRIPT);
   const skill = readSkill('/nonexistent/skill/SKILL.md');
@@ -202,7 +532,7 @@ test('loadAgents loads agent markdown files', () => {
     'name: typescript-reviewer',
     'description: Reviews TypeScript code',
     'model: claude-sonnet-4-6',
-    'tools: [Bash, Read, Write, Grep]',
+    'tools: Bash, Read, Write, Grep',
     '---',
     '# TypeScript Reviewer',
     'You are a TypeScript code reviewer.',
@@ -212,7 +542,7 @@ test('loadAgents loads agent markdown files', () => {
     'name: python-reviewer',
     'description: Reviews Python code',
     'model: claude-opus-4-8',
-    'tools: [Bash, Read]',
+    'tools: Bash, Read',
     '---',
     '# Python Reviewer',
   ].join('\n'));
@@ -661,49 +991,228 @@ test('renderHTML includes the dashboard title and footer', () => {
 
 // ===================== Server / HTTP =====================
 
-test('server returns HTML on GET /', (done) => {
-  const { server } = require(SCRIPT);
-  // Server may or may not be listening — we start it on a random port
-  const testServer = http.createServer(server._events.request);
-  testServer.listen(0, () => {
-    const port = testServer.address().port;
-    http.get(`http://localhost:${port}/`, (res) => {
-      assert.strictEqual(res.statusCode, 200);
-      assert.strictEqual(res.headers['content-type'], 'text/html; charset=utf-8');
-      let body = '';
-      res.on('data', (chunk) => { body += chunk; });
-      res.on('end', () => {
-        assert.ok(body.includes('<!DOCTYPE html>'));
-        assert.ok(body.includes('ECC Capabilities'));
-        testServer.close();
-        done();
-      });
-    });
+test('resolveDashboardHost defaults to IPv4 loopback', () => {
+  const { resolveDashboardHost } = require(SCRIPT);
+  assert.strictEqual(resolveDashboardHost({}), '127.0.0.1');
+  assert.strictEqual(resolveDashboardHost({ ECC_DASHBOARD_HOST: '' }), '127.0.0.1');
+});
+
+test('resolveDashboardHost accepts only normalized loopback hosts', () => {
+  const { resolveDashboardHost } = require(SCRIPT);
+  assert.strictEqual(
+    resolveDashboardHost({ ECC_DASHBOARD_HOST: ' LOCALHOST ' }),
+    'localhost'
+  );
+  assert.strictEqual(
+    resolveDashboardHost({ ECC_DASHBOARD_HOST: '::1' }),
+    '::1'
+  );
+  assert.strictEqual(
+    resolveDashboardHost({ ECC_DASHBOARD_HOST: '[::1]' }),
+    '::1'
+  );
+});
+
+test('resolveDashboardHost rejects wildcard, LAN, and arbitrary hosts', () => {
+  const { resolveDashboardHost } = require(SCRIPT);
+  for (const host of ['0.0.0.0', '::', '192.168.1.10', 'dashboard.internal', '127.0.0.1:3456']) {
+    assert.throws(
+      () => resolveDashboardHost({ ECC_DASHBOARD_HOST: host }),
+      /ECC_DASHBOARD_HOST must be loopback-only/
+    );
+  }
+});
+
+test('listenDashboardServer always passes an explicit loopback host to listen', () => {
+  const { listenDashboardServer } = require(SCRIPT);
+  const calls = [];
+  const fakeServer = {
+    listen(...args) {
+      calls.push(args);
+      return this;
+    },
+  };
+  const onListening = () => {};
+
+  assert.strictEqual(
+    listenDashboardServer(fakeServer, {
+      host: '127.0.0.1',
+      onListening,
+      port: 3456,
+    }),
+    fakeServer
+  );
+  assert.deepStrictEqual(calls, [[3456, '127.0.0.1', onListening]]);
+  assert.throws(
+    () => listenDashboardServer(fakeServer, { host: '0.0.0.0', port: 3456 }),
+    /ECC_DASHBOARD_HOST must be loopback-only/
+  );
+  assert.strictEqual(calls.length, 1);
+});
+
+asyncTest('server returns no-store HTML on GET /', async () => {
+  await withDashboardServer(async (port) => {
+    const response = await requestDashboard(port);
+    assert.strictEqual(response.statusCode, 200);
+    assert.strictEqual(response.headers['content-type'], 'text/html; charset=utf-8');
+    assert.strictEqual(response.headers['cache-control'], 'no-store');
+    assert.ok(response.body.includes('<!DOCTYPE html>'));
+    assert.ok(response.body.includes('ECC Capabilities'));
   });
 });
 
-test('server returns JSON on GET /api/data', (done) => {
-  const { server } = require(SCRIPT);
-  const testServer = http.createServer(server._events.request);
-  testServer.listen(0, () => {
-    const port = testServer.address().port;
-    http.get(`http://localhost:${port}/api/data`, (res) => {
-      assert.strictEqual(res.statusCode, 200);
-      assert.strictEqual(res.headers['content-type'], 'application/json');
-      let body = '';
-      res.on('data', (chunk) => { body += chunk; });
-      res.on('end', () => {
-        const parsed = JSON.parse(body);
-        assert.ok(Array.isArray(parsed.agents));
-        assert.ok(Array.isArray(parsed.skills));
-        assert.ok(Array.isArray(parsed.commands));
-        assert.ok(Array.isArray(parsed.rules));
-        assert.ok(Array.isArray(parsed.mcps));
-        assert.ok(Array.isArray(parsed.hooks));
-        testServer.close();
-        done();
-      });
+asyncTest('server returns no-store JSON on GET /api/data', async () => {
+  await withDashboardServer(async (port) => {
+    const response = await requestDashboard(port, { path: '/api/data' });
+    assert.strictEqual(response.statusCode, 200);
+    assert.strictEqual(response.headers['content-type'], 'application/json');
+    assert.strictEqual(response.headers['cache-control'], 'no-store');
+    const parsed = JSON.parse(response.body);
+    assert.ok(Array.isArray(parsed.agents));
+    assert.ok(Array.isArray(parsed.skills));
+    assert.ok(Array.isArray(parsed.commands));
+    assert.ok(Array.isArray(parsed.rules));
+    assert.ok(Array.isArray(parsed.mcps));
+    assert.ok(Array.isArray(parsed.hooks));
+  });
+});
+
+asyncTest('server returns a generic no-store 500 for data failures and remains usable', async () => {
+  let loadCount = 0;
+  const loggedErrors = [];
+  const emptyData = {
+    agents: [],
+    skills: [],
+    commands: [],
+    rules: [],
+    mcps: [],
+    hooks: [],
+  };
+
+  await withDashboardServer(async (port) => {
+    const failedResponse = await requestDashboard(port, { path: '/api/data' });
+    assert.strictEqual(failedResponse.statusCode, 500);
+    assert.strictEqual(failedResponse.headers['cache-control'], 'no-store');
+    assert.deepStrictEqual(JSON.parse(failedResponse.body), {
+      error: 'Internal server error',
     });
+    assert.ok(!failedResponse.body.includes('sensitive loader detail'));
+
+    const followUpResponse = await requestDashboard(port, { path: '/api/data' });
+    assert.strictEqual(followUpResponse.statusCode, 200);
+    assert.deepStrictEqual(JSON.parse(followUpResponse.body), emptyData);
+    assert.strictEqual(loggedErrors.length, 1);
+    assert.strictEqual(loggedErrors[0].error.message, 'sensitive loader detail');
+  }, {
+    loadData: () => {
+      loadCount++;
+      if (loadCount === 1) {
+        throw new Error('sensitive loader detail');
+      }
+      return emptyData;
+    },
+    reportError: (message, error) => {
+      loggedErrors.push({ error, message });
+    },
+  });
+});
+
+asyncTest('server returns a generic no-store 500 for render failures and remains usable', async () => {
+  const { renderHTML } = require(SCRIPT);
+  let renderCount = 0;
+  const loggedErrors = [];
+  const emptyData = {
+    agents: [],
+    skills: [],
+    commands: [],
+    rules: [],
+    mcps: [],
+    hooks: [],
+  };
+
+  await withDashboardServer(async (port) => {
+    const failedResponse = await requestDashboard(port);
+    assert.strictEqual(failedResponse.statusCode, 500);
+    assert.strictEqual(failedResponse.headers['cache-control'], 'no-store');
+    assert.strictEqual(
+      failedResponse.body,
+      '<!DOCTYPE html><p>Dashboard unavailable.</p>'
+    );
+    assert.ok(!failedResponse.body.includes('sensitive render detail'));
+
+    const followUpResponse = await requestDashboard(port);
+    assert.strictEqual(followUpResponse.statusCode, 200);
+    assert.ok(followUpResponse.body.includes('ECC Capabilities'));
+    assert.strictEqual(loggedErrors.length, 1);
+    assert.strictEqual(loggedErrors[0].error.message, 'sensitive render detail');
+  }, {
+    loadData: () => emptyData,
+    render: (data) => {
+      renderCount++;
+      if (renderCount === 1) {
+        throw new Error('sensitive render detail');
+      }
+      return renderHTML(data);
+    },
+    reportError: (message, error) => {
+      loggedErrors.push({ error, message });
+    },
+  });
+});
+
+asyncTest('server rejects a missing or DNS-rebinding Host before routing', async () => {
+  await withDashboardServer(async (port) => {
+    const missingHost = await requestDashboardWithoutHost(port);
+    assert.strictEqual(missingHost.statusCode, 421);
+    assert.strictEqual(missingHost.headers['cache-control'], 'no-store');
+
+    const reboundHost = await requestDashboard(port, {
+      headers: { Host: 'dashboard.attacker.example' },
+      path: '/api/data',
+    });
+    assert.strictEqual(reboundHost.statusCode, 421);
+    assert.strictEqual(reboundHost.headers['cache-control'], 'no-store');
+  });
+});
+
+asyncTest('server rejects an allowed hostname with an invalid port without crashing', async () => {
+  await withDashboardServer(async (port) => {
+    const response = await requestDashboard(port, {
+      headers: { Host: 'localhost:99999' },
+      path: '/api/data',
+    });
+    assert.strictEqual(response.statusCode, 421);
+    assert.strictEqual(response.headers['cache-control'], 'no-store');
+  });
+});
+
+asyncTest('server returns a generic no-store 400 for a malformed absolute request target and remains usable', async () => {
+  await withDashboardServer(async (port) => {
+    const malformedResponse = await requestDashboard(port, {
+      path: 'http://attacker.example:99999/',
+    });
+    assert.strictEqual(malformedResponse.statusCode, 400);
+    assert.strictEqual(malformedResponse.headers['cache-control'], 'no-store');
+    assert.deepStrictEqual(JSON.parse(malformedResponse.body), {
+      error: 'Bad request',
+    });
+
+    const followUpResponse = await requestDashboard(port, {
+      path: '/api/data',
+    });
+    assert.strictEqual(followUpResponse.statusCode, 200);
+    assert.strictEqual(followUpResponse.headers['cache-control'], 'no-store');
+  });
+});
+
+asyncTest('server rejects cross-origin requests before routing', async () => {
+  await withDashboardServer(async (port) => {
+    const response = await requestDashboard(port, {
+      headers: { Origin: 'https://attacker.example' },
+      path: '/api/data',
+    });
+    assert.strictEqual(response.statusCode, 403);
+    assert.strictEqual(response.headers['cache-control'], 'no-store');
   });
 });
 
@@ -791,7 +1300,87 @@ test('loadMcps handles empty mcp-configs directory', () => {
   cleanup(testRoot);
 });
 
+// ===================== Entrypoint browser auto-open =====================
+
+function findFreePort() {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+if (process.platform !== 'win32') {
+  asyncTest('entrypoint keeps serving when the browser launcher is missing', async () => {
+    const { spawn } = require('child_process');
+    const dir = createTempDir('ecc-dashboard-no-launcher-');
+    const emptyBin = path.join(dir, 'bin');
+    fs.mkdirSync(emptyBin);
+    const port = await findFreePort();
+    // An empty PATH means `xdg-open` / `open` cannot be found, so the
+    // auto-open spawn fails asynchronously with ENOENT.
+    const child = spawn(process.execPath, [SCRIPT, String(port)], {
+      env: { PATH: emptyBin, HOME: dir, CLAUDE_CONFIG_DIR: path.join(dir, '.claude') },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const exited = new Promise(resolve => child.once('exit', resolve));
+    try {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`banner not printed; stderr: ${stderr}`)), 10000);
+        const check = () => {
+          if (stdout.includes('ECC Capabilities')) {
+            clearTimeout(timer);
+            resolve();
+          }
+        };
+        child.stdout.on('data', check);
+        child.once('exit', code => {
+          clearTimeout(timer);
+          reject(new Error(`dashboard exited with ${code} before listening; stderr: ${stderr}`));
+        });
+        check();
+      });
+      // Give the asynchronous spawn error time to surface.
+      await new Promise(resolve => setTimeout(resolve, 500));
+      assert.strictEqual(child.exitCode, null, `dashboard exited after listening; stderr: ${stderr}`);
+      assert.strictEqual(child.signalCode, null);
+      assert.match(stderr, /Could not open a browser automatically \(ENOENT\)/);
+      const response = await requestDashboard(port);
+      assert.strictEqual(response.statusCode, 200);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill();
+        await exited;
+      }
+      cleanup(dir);
+    }
+  });
+}
+
 // ===================== Results =====================
 
-console.log(`\nResults: Passed: ${testPassed}, Failed: ${testFailed}`);
-process.exit(testFailed > 0 ? 1 : 0);
+async function runAsyncTests() {
+  for (const { name, fn } of asyncTests) {
+    try {
+      await fn();
+      console.log(`  ✓ ${name}`);
+      testPassed++;
+    } catch (error) {
+      console.log(`  ✗ ${name}`);
+      console.log(`    Error: ${error.message}`);
+      testFailed++;
+    }
+  }
+
+  console.log(`\nResults: Passed: ${testPassed}, Failed: ${testFailed}`);
+  process.exitCode = testFailed > 0 ? 1 : 0;
+}
+
+runAsyncTests();

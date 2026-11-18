@@ -6,7 +6,7 @@
  * Supports cross-platform command generation.
  */
 
-import { tool, type ToolDefinition } from "@opencode-ai/plugin/tool"
+import { tool, type ToolDefinition } from "./tool.ts"
 import * as path from "path"
 import * as fs from "fs"
 
@@ -107,7 +107,7 @@ function buildFormatterCommand(formatter: Formatter, filePath: string, cwd?: str
   // Normalize to forward slashes so the emitted command is identical on every
   // platform. `path.normalize` yields backslashes on Windows, which broke the
   // command string (and Windows CI); all formatter CLIs accept `/` on Windows.
-  const normalizedPath = path.normalize(filePath).split(path.sep).join("/")
+  const normalizedPath = path.normalize(filePath).replace(/\\/g, "/")
 
   // Build command based on formatter and platform
   const commands: Record<Formatter, string> = {

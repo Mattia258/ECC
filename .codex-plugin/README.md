@@ -8,59 +8,159 @@ This directory contains the **Codex plugin manifest** for ECC.
 .codex-plugin/
 └── plugin.json   — Codex plugin manifest (name, version, skills ref, MCP ref)
 .mcp.json         — MCP server configurations at plugin root (NOT inside .codex-plugin/)
+hooks/codex-hooks.json — Codex-compatible lifecycle hook projection
 ```
 
 ## What This Provides
 
-- **249 skills** from `./skills/` — reusable Codex workflows for TDD, security,
+- **281 skills** from `./skills/` — reusable Codex workflows for TDD, security,
   code review, architecture, and more
-- **6 MCP servers** — GitHub, Context7, Exa, Memory, Playwright, Sequential Thinking
+- **1 default MCP server** — Chrome DevTools; retired connectors remain opt-in
+- **Codex lifecycle hooks** — synchronous command hooks on supported events,
+  with explicit review and trust in `/hooks`
 
 ## Installation
 
-Codex plugin support is marketplace-backed. The repo exposes a repo-scoped
-marketplace at `.agents/plugins/marketplace.json`; Codex can add and track that
-marketplace source from the CLI:
+Codex 0.146.0 and newer use `plugin add`, not `plugin install`. Add ECC's
+repository marketplace, install the native plugin, and verify the registration:
 
 ```bash
-# Add the public repo marketplace
 codex plugin marketplace add affaan-m/ECC
-
-# Or add a local checkout while developing
-codex plugin marketplace add /absolute/path/to/ECC
+codex plugin add ecc@ecc
+codex plugin list --json
 ```
 
-The marketplace entry points at `plugins/ecc/` — Codex does not discover
-plugins whose local marketplace `source.path` is the marketplace root (`./`),
-so the entry must target a concrete plugin subdirectory (see
-[#2128](https://github.com/affaan-m/ECC/issues/2128)). That thin plugin folder
-references the root `skills/` and `.mcp.json` so content stays single-sourced.
-After adding or updating the marketplace, restart Codex and install or enable
-`ecc` from the plugin directory.
+Both add commands are safe to run again. A repeated marketplace add reports
+`alreadyAdded: true`, and a repeated plugin add keeps the same enabled plugin
+registration. To fetch a newer marketplace snapshot before applying a new ECC
+release, run:
+
+```bash
+codex plugin marketplace upgrade ecc
+codex plugin add ecc@ecc
+```
+
+For local development, the same native journey accepts a checkout path:
+
+```bash
+codex plugin marketplace add /absolute/path/to/ECC
+codex plugin add ecc@ecc
+```
+
+ECC's marketplace entry points at the repository root. Codex copies the selected
+plugin source into its cache, so the root source keeps `skills/`, `.mcp.json`,
+`hooks/`, hook scripts, and presentation assets together. Parent-relative paths
+from a thin plugin directory would escape that cache and produce an installed
+registration with missing runtime content.
+
+Restart Codex after installation. You can also open `/plugins` in Codex CLI to
+inspect, enable, disable, or remove the plugin. The native Codex plugin does not
+use Claude's `user`, `project`, or `local` install scopes: its enabled state is
+stored once in the active `CODEX_HOME` (normally `~/.codex`) and applies to
+Codex sessions using that home.
+
+## Hooks and reconfiguration
+
+The Codex manifest uses the documented `hooks` field to bundle
+`./hooks/codex-hooks.json`. This provider-specific projection keeps the
+synchronous `SessionStart` bootstrap verified against Codex 0.146. Claude hook
+profiles are not Codex hook profiles: handlers that block tools, use unsupported
+events, run asynchronously, or fail Codex's hook protocol stay out of the native
+bundle. Codex enables hook support by default, but native plugin installation
+does not silently authorize commands. Start a new Codex session, open `/hooks`,
+then review and trust the ECC hook definition before enabling it.
+Codex records trust against each definition's hash, so changed hooks require
+review again. Use `/plugins` for plugin enablement and `/hooks` for hook trust;
+these are separate controls.
+
+Once the cached skills are available, invoke `$configure-ecc` inside Codex for
+ECC's guided configuration. Installing the plugin again is idempotent and does
+not create a second scope or duplicate hook registration.
+
+## Runtime dependencies and Codex 0.164.0 cache checks
+
+Native marketplace installation copies ECC's source; it does not run `npm ci`
+for its hook dependencies. If a hook reports a missing runtime package, first
+run `codex plugin list --json` with the same `CODEX_HOME` as the affected
+session. Find the installed, enabled `ecc@ecc` entry and its version; do not
+select a version merely because its directory exists. From an ECC checkout,
+check that version explicitly:
+
+```bash
+# Replace <installed-version> with the version from Codex's installed entry.
+node scripts/codex/check-plugin-cache.js --version '<installed-version>'
+```
+
+If the affected session's hook warning identifies the exact ECC plugin root,
+prefer `node scripts/codex/check-plugin-cache.js --plugin-dir "/absolute/path/to/active/ecc/cache"`.
+Use the same `CODEX_HOME` for the version check (or pass `--codex-home`). The
+checker's default comes from the checkout's `package.json`; it does not discover
+the active version, and a passing check against an older cache is insufficient.
+Confirm the selected root matches the affected session before installing. Do
+not use the deprecated sync script to repair the native plugin.
+
+Codex 0.164.0 can reject a plugin after a normal dependency install with
+`unsupported plugin entry type ... node_modules/.bin/js-yaml`. npm normally
+creates executable symlinks in `.bin`; that Codex version's hook fingerprint
+walker accepts only directories and regular files. See
+[ECC #3742](https://github.com/affaan-m/ECC/issues/3742) and the
+[Codex fingerprint implementation](https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/hooks/src/engine/plugin_fingerprint.rs).
+
+For an explicitly chosen cache-local dependency install, use npm's
+[`--no-bin-links`](https://docs.npmjs.com/cli/v11/commands/npm-ci#bin-links)
+option to install the runtime packages without creating executable links:
+
+```bash
+# Set this to the active ECC plugin root confirmed above.
+ECC_PLUGIN_CACHE="/absolute/path/to/active/ecc/cache"
+(
+  set -eu
+  cd -- "$ECC_PLUGIN_CACHE"
+  test -f package.json
+  test -f package-lock.json
+  npm ci --omit=dev --ignore-scripts --no-audit --no-fund --no-bin-links
+  node -e "require('js-yaml'); require('@iarna/toml'); require('ajv'); require('sql.js'); require('zod')"
+)
+```
+
+The cache root must contain ECC's `package.json` and `package-lock.json`. The
+subshell stops on a failed directory change, missing manifest, or failed install
+before running any later command, and leaves the caller's directory unchanged.
+`npm ci` replaces its dependency tree; this opt-in command is not part of the
+default Codex installer. The final command checks Node package resolution, not
+Codex hook execution. Executable shortcuts in `node_modules/.bin` are
+intentionally unavailable; ECC hooks load these packages through Node.
+
+Restart Codex, review the updated hook definitions in `/hooks`, and verify a
+new session's actual hook result. Do not disable fingerprint or trust checks.
+This addresses npm-generated executable links, not every possible unsupported
+cache entry or the upstream Codex defect. A marketplace refresh can replace
+cache-local changes; recheck the active version before applying the command
+again.
+
+## Native plugin versus legacy managed sync
+
+The commands above are the native Codex plugin path. The deprecated legacy managed sync
+(`bash scripts/sync-ecc-to-codex.sh`) is a separate compatibility
+path that merges files into `~/.codex`. It is not a native plugin install and
+does not create a marketplace registration. Prefer the native path on current
+Codex; use the legacy managed sync only when you intentionally need its copied
+configuration layer.
+
+New sync runs record a versioned ownership manifest. Inspect or remove that
+layer explicitly with `ecc uninstall --legacy-codex-sync --dry-run`, followed
+by `ecc uninstall --legacy-codex-sync`. Cleanup never targets conversation
+history or native plugin caches. Older pre-manifest installs are cleaned
+conservatively and unverifiable files are retained with warnings.
 
 After install, `codex plugin list` is only a registration check. From an ECC
-checkout, run the cache check to verify that the installed manifest can resolve
-its referenced skills, MCP config, and assets:
+checkout, set `ECC_PLUGIN_CACHE` to the active root identified above, then run
+the cache check to verify that the installed manifest can resolve its referenced
+skills, MCP config, and assets:
 
 ```bash
-node scripts/codex/check-plugin-cache.js
+node scripts/codex/check-plugin-cache.js --plugin-dir "$ECC_PLUGIN_CACHE"
 ```
-
-> **Plugin mode is currently fragile on Codex.** Marketplace discovery and
-> install work with this layout, but runtime skill loading from local/repo
-> marketplaces is unreliable upstream
-> ([openai/codex#26037](https://github.com/openai/codex/issues/26037)) — Codex
-> copies only the plugin folder into its install cache, so parent-referenced
-> content may not be exposed in a fresh session. The safer, fully supported
-> path today is the manual sync flow:
-> `npm install && bash scripts/sync-ecc-to-codex.sh`.
-
-Official Plugin Directory publishing is coming soon. For official OpenAI
-plugin-directory review, package this repo under the `openai/plugins`
-repository shape: `plugins/ecc/.codex-plugin/plugin.json`,
-`plugins/ecc/skills/`, and the supporting README/assets. Until that listing is
-accepted, treat the public repo marketplace as the supported Codex distribution
-path and keep release copy framed as repo-marketplace/manual installation.
 
 The installed plugin registers under the short slug `ecc` so tool and command names
 stay below provider length limits.

@@ -1,9 +1,10 @@
 # Evaluator RAG Prototype
 
-ECC 2.0 needs a self-improving harness loop that can learn from real work
-without blindly mutating a user's Claude, Codex, OpenCode, dmux, Zed, or
-terminal setup. This prototype defines the smallest read-only artifact set for
-that loop.
+ECC 2.0 needs an evidence-driven harness evaluation loop that can compare
+operator-supplied candidates from real work without implying model learning or
+blindly mutating a user's Claude, Codex, OpenCode, dmux, Zed, or terminal
+setup. This prototype defines the smallest read-only artifact set for that
+loop.
 
 The fixture set lives in
 [`examples/evaluator-rag-prototype/`](../../examples/evaluator-rag-prototype/).
@@ -22,6 +23,11 @@ working examples, reference-set gaps, and validation commands before a skill
 amendment can be promoted. A deep-analyzer evidence scenario requires analyzer
 corpus cases, expected-output comparisons, and risk-taxonomy proof before
 repository or commit-analysis behavior can change.
+In an orchestration-efficiency evidence scenario, single-agent controls must be
+matched, and aggregate controller, worker, verifier, and retry cost, accepted
+quality, coordination costs, and sequential paired replications are required
+before parallelism is called faster or cheaper. Per-pair deltas that are
+mixed-sign or unavailable make the result inconclusive and block the claim.
 
 ## Reference Pressure
 
@@ -121,6 +127,23 @@ Current corpus:
 - `deep-analyzer-evidence`: requires maintained analyzer corpus cases,
   expected-output comparisons, representative repository/commit histories, and
   regression commands before deep-analysis behavior can be promoted.
+- `orchestration-efficiency-evidence`: requires dependency and ownership plans,
+  matched single-agent controls, common acceptance gates, aggregate worker
+  costs, retained failures and coordination overhead, and repeated sequential
+  pairs before an orchestration-efficiency recommendation can be promoted.
+  Per-pair quality, time, and cost deltas must keep one sign across every pair;
+  otherwise the result is `inconclusive` and no candidate is promoted.
+
+- `connector-diagnostics-gap`: inventories an already-used connector, separates
+  observed gaps from unavailable research, and requires evidence before a new
+  background component is proposed. Decisions are illustrative, not executed
+  connector checks.
+- `public-feedback-goal-fidelity`: compares a shortened draft with the chosen
+  outcome and input/process/result chain, preserving verification limits and
+  separating optional alternatives. Decisions are illustrative.
+- `prepared-verifier-effect-state`: checks prepared command contracts while
+  preserving accepted, unknown and not-dispatched operation states. Separate
+  source-reported mechanisms remain separate; decisions are illustrative.
 
 ## ECC Tools Mapping
 
